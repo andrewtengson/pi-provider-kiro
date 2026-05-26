@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `"pi-package"` keyword to `package.json` for discoverability on https://pi.dev/packages ([#61](https://github.com/mikeyobrien/pi-provider-kiro/issues/61))
+
 ### Fixed
 
 - Expose `xhigh` thinking level in pi UI for all reasoning models by declaring `thinkingLevelMap` metadata

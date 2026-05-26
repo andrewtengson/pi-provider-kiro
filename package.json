@@ -9,6 +9,7 @@
     "url": "git+https://github.com/mikeyobrien/pi-provider-kiro.git"
   },
   "keywords": [
+    "pi-package",
     "pi",
     "kiro",
     "aws",
