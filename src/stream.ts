@@ -57,15 +57,8 @@ import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js
 
 const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
-const CONTINUATION_INSTRUCTION =
-  "Continue the unfinished work now. Do not only describe the next step: perform it using tools when needed, then return the completed result.";
-
-function promisesImmediateWork(text: string): boolean {
-  const progressivePlan = /\bI(?:['’]m| am)\s+\w+ing\b[\s\S]{0,400}\b(?:then|before|first|and will)\b/i;
-  const explicitPlan = /\bI(?:['’]ll| will)\s+(?:first\s+)?\w+/i;
-  const nextStep = /(?:^|[.!?]\s+)Next (?:step|validation|check|test|action)\s*:/i;
-  return progressivePlan.test(text) || explicitPlan.test(text) || nextStep.test(text);
-}
+const TOOL_TURN_CONTRACT =
+  "If work remains, invoke a tool in this response. Do not end with only a progress update. Return text-only only when the user’s task is complete.";
 
 const eventStreamMarshaller = new UniversalEventStreamMarshaller({
   utf8Encoder: (input: Uint8Array) => new TextDecoder().decode(input),
@@ -291,8 +284,6 @@ export function streamKiro(
         systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${systemPrompt ? `\n${systemPrompt}` : ""}`;
       }
       let retryCount = 0;
-      let continuationAttempted = false;
-      let interruptedProgress = "";
       const maxRetries = 3;
       const conversationId = options?.sessionId ?? crypto.randomUUID();
       while (retryCount <= maxRetries) {
@@ -402,9 +393,6 @@ export function streamKiro(
           if (effectiveSystemPrompt && !systemPrepended)
             currentContent = `${effectiveSystemPrompt}\n\n${currentContent}`;
         }
-        if (interruptedProgress) {
-          currentContent = `${CONTINUATION_INSTRUCTION}\n\nThe interrupted response was:\n${interruptedProgress}`;
-        }
         // Prepend truncation notice if the previous assistant response was cut off
         if (wasPreviousResponseTruncated(context.messages)) {
           currentContent = `${TRUNCATION_NOTICE}\n\n${currentContent}`;
@@ -417,6 +405,9 @@ export function streamKiro(
         let uimc: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] } | undefined;
         const baseTools = context.tools?.length ? convertToolsToKiro(context.tools) : [];
         const finalTools = history.length > 0 ? addPlaceholderTools(baseTools, history) : baseTools;
+        if (baseTools.length > 0) {
+          currentContent = `${currentContent}\n\n${TOOL_TURN_CONTRACT}`;
+        }
         if (currentToolResults.length > 0 || finalTools.length > 0) {
           uimc = {};
           if (currentToolResults.length > 0) uimc.toolResults = currentToolResults;
@@ -793,23 +784,6 @@ export function streamKiro(
           if (/^\s*(\.+|continue)\s*$/i.test(textBlock.text)) {
             textBlock.text = "";
           }
-        }
-        // Kiro occasionally ends a turn after a progress preamble without a
-        // tool call. Retry exactly once only when the response explicitly
-        // promises immediate implementation work. Genuine final prose and a
-        // second interrupted response remain terminal.
-        const completedText = textBlockIndex !== null ? (output.content[textBlockIndex] as TextContent).text : "";
-        if (
-          emittedToolCalls === 0 &&
-          receivedContextUsage &&
-          !continuationAttempted &&
-          promisesImmediateWork(completedText)
-        ) {
-          continuationAttempted = true;
-          interruptedProgress = completedText;
-          output.content = [];
-          textBlockIndex = null;
-          continue;
         }
         if (textBlockIndex !== null)
           stream.push({
