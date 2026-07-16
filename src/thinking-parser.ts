@@ -96,6 +96,14 @@ export class ThinkingTagParser {
     return this.textBlockIndex ?? this.lastTextBlockIndex;
   }
 
+  getThinkingBlockIndex(): number | null {
+    return this.thinkingBlockIndex;
+  }
+
+  emitNativeThinking(thinking: string): void {
+    this.emitThinking(thinking);
+  }
+
   private processBeforeThinking(): void {
     let bestPos = -1;
     let bestVariant: (typeof THINKING_TAG_VARIANTS)[number] | null = null;

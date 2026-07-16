@@ -141,6 +141,35 @@ describe("Feature 5: Message Transformation", () => {
       expect(history[0].userInputMessage?.content).toMatch(/^Be helpful/);
     });
 
+    it("replays signed thinking as native reasoning content", () => {
+      const a = assistant("");
+      a.content = [
+        {
+          type: "thinking",
+          thinking: "private reasoning",
+          thinkingSignature: "signed-reasoning",
+        } as ThinkingContent & { thinkingSignature: string },
+        { type: "text", text: "answer" },
+      ];
+      const { history } = buildHistory([user("question"), a, user("follow-up")], "M");
+
+      expect(history[1].assistantResponseMessage).toEqual({
+        content: "answer",
+        reasoningContent: {
+          reasoningText: { text: "private reasoning", signature: "signed-reasoning" },
+        },
+      });
+    });
+
+    it("keeps unsigned thinking as XML fallback", () => {
+      const a = assistant("");
+      a.content = [{ type: "thinking", thinking: "legacy reasoning" }];
+      const { history } = buildHistory([user("question"), a, user("follow-up")], "M");
+
+      expect(history[1].assistantResponseMessage?.content).toContain("<thinking>legacy reasoning</thinking>");
+      expect(history[1].assistantResponseMessage?.reasoningContent).toBeUndefined();
+    });
+
     it("converts assistant tool calls", () => {
       const a = assistant("");
       a.content = [{ type: "toolCall", id: "tc1", name: "bash", arguments: { cmd: "ls" } }];

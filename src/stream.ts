@@ -44,6 +44,7 @@ import {
   getContentText,
   type KiroHistoryEntry,
   type KiroImage,
+  type KiroReasoningContent,
   type KiroToolResult,
   type KiroToolSpec,
   type KiroUserInputMessage,
@@ -113,6 +114,7 @@ interface KiroRequest {
     history?: KiroHistoryEntry[];
   };
   profileArn?: string;
+  additionalModelRequestFields?: { reasoning: { effort: string } } | { output_config: { effort: string } };
   agentMode?: string;
 }
 interface KiroToolCallState {
@@ -258,6 +260,11 @@ export function streamKiro(
 
       const kiroModelId = resolveKiroModel(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
+      const requestedKiroEffort = options?.reasoning === "minimal" ? "low" : options?.reasoning;
+      const kiroEffort =
+        requestedKiroEffort && ["low", "medium", "high", "xhigh"].includes(requestedKiroEffort)
+          ? requestedKiroEffort
+          : undefined;
       debugLog("request.init", {
         endpoint,
         model: model.id,
@@ -272,7 +279,7 @@ export function streamKiro(
         sessionId: options?.sessionId,
       });
       let systemPrompt = context.systemPrompt ?? "";
-      if (thinkingEnabled) {
+      if (thinkingEnabled && !kiroEffort) {
         const budget =
           options?.reasoning === "xhigh"
             ? 50000
@@ -310,13 +317,21 @@ export function streamKiro(
         if (firstMsg?.role === "assistant") {
           const am = firstMsg as AssistantMessage;
           let armContent = "";
+          let armReasoningContent: KiroReasoningContent | undefined;
           const armToolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
           if (Array.isArray(am.content))
             for (const b of am.content) {
               if (b.type === "text") armContent += (b as TextContent).text;
-              else if (b.type === "thinking")
-                armContent = `<thinking>${(b as unknown as { thinking: string }).thinking}</thinking>\n\n${armContent}`;
-              else if (b.type === "toolCall") {
+              else if (b.type === "thinking") {
+                const thinkingBlock = b as unknown as { thinking: string; thinkingSignature?: string };
+                if (thinkingBlock.thinkingSignature) {
+                  armReasoningContent = {
+                    reasoningText: { text: thinkingBlock.thinking, signature: thinkingBlock.thinkingSignature },
+                  };
+                } else {
+                  armContent = `<thinking>${thinkingBlock.thinking}</thinking>\n\n${armContent}`;
+                }
+              } else if (b.type === "toolCall") {
                 const tc = b as ToolCall;
                 armToolUses.push({
                   name: tc.name,
@@ -328,7 +343,7 @@ export function streamKiro(
                 });
               }
             }
-          if (armContent || armToolUses.length > 0) {
+          if (armContent || armReasoningContent || armToolUses.length > 0) {
             const lastEntryForArm = history[history.length - 1];
             const prevArm = lastEntryForArm?.assistantResponseMessage;
             if (history.length > 0 && !lastEntryForArm?.userInputMessage && prevArm) {
@@ -339,6 +354,7 @@ export function streamKiro(
               history.push({
                 assistantResponseMessage: {
                   content: armContent,
+                  ...(armReasoningContent ? { reasoningContent: armReasoningContent } : {}),
                   ...(armToolUses.length > 0 ? { toolUses: armToolUses } : {}),
                 },
               });
@@ -429,6 +445,13 @@ export function streamKiro(
             ...(history.length > 0 ? { history } : {}),
           },
           ...(profileArn ? { profileArn } : {}),
+          ...(kiroEffort
+            ? {
+                additionalModelRequestFields: model.id.startsWith("gpt-")
+                  ? { reasoning: { effort: kiroEffort } }
+                  : { output_config: { effort: kiroEffort } },
+              }
+            : {}),
           agentMode: "vibe",
         };
         let response!: Response;
@@ -535,6 +558,25 @@ export function streamKiro(
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
         let receivedContextUsage = false;
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
+        let nativeReasoningActive = false;
+        let nativeReasoningSignature: string | undefined;
+        const finishNativeReasoning = () => {
+          const contentIndex = thinkingParser?.getThinkingBlockIndex();
+          if (!nativeReasoningActive || contentIndex === null || contentIndex === undefined) return;
+          const thinkingBlock = output.content[contentIndex] as unknown as {
+            thinking: string;
+            thinkingSignature?: string;
+          };
+          if (nativeReasoningSignature) thinkingBlock.thinkingSignature = nativeReasoningSignature;
+          stream.push({
+            type: "thinking_end",
+            contentIndex,
+            content: thinkingBlock.thinking,
+            partial: output,
+          });
+          nativeReasoningActive = false;
+          nativeReasoningSignature = undefined;
+        };
         let textBlockIndex: number | null = null;
         let emittedToolCalls = 0;
         let sawAnyToolCalls = false;
@@ -633,7 +675,17 @@ export function streamKiro(
               receivedContextUsage = true;
               break;
             }
+            case "reasoning": {
+              nativeReasoningActive = true;
+              if (event.data.text) {
+                thinkingParser?.emitNativeThinking(event.data.text);
+                totalContent += event.data.text;
+              }
+              if (event.data.signature) nativeReasoningSignature = event.data.signature;
+              break;
+            }
             case "content": {
+              finishNativeReasoning();
               if (event.data === lastContentData) continue;
               lastContentData = event.data;
               totalContent += event.data;
@@ -651,6 +703,7 @@ export function streamKiro(
               break;
             }
             case "toolUse": {
+              finishNativeReasoning();
               const tc = event.data;
               sawAnyToolCalls = true;
               if (!currentToolCall || currentToolCall.toolUseId !== tc.toolUseId) {
@@ -702,6 +755,7 @@ export function streamKiro(
         if (currentToolCall && emitToolCall(currentToolCall, output, stream)) {
           emittedToolCalls++;
         }
+        finishNativeReasoning();
         if (thinkingParser) {
           thinkingParser.finalize();
           textBlockIndex = thinkingParser.getTextBlockIndex();

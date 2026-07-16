@@ -285,6 +285,49 @@ describe("Feature 9: Streaming Integration", () => {
   // Thinking + text streaming (pi-mono: stream.test.ts handleThinking)
   // =========================================================================
 
+  it.each([
+    ["gpt-5-6-sol", "minimal", { reasoning: { effort: "low" } }],
+    ["gpt-5-6-sol", "high", { reasoning: { effort: "high" } }],
+    ["claude-opus-4-8", "high", { output_config: { effort: "high" } }],
+  ] as const)("sends native %s effort using the model-family schema", async (modelId, reasoning, expected) => {
+    const mockFetch = mockFetchOk('{"content":"answer"}{"contextUsagePercentage":10}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel({ id: modelId, reasoning: true }), makeContext(), { apiKey: "tok", reasoning }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.additionalModelRequestFields).toEqual(expected);
+    expect(body.conversationState.currentMessage.userInputMessage.content).not.toContain("<thinking_mode>");
+    vi.unstubAllGlobals();
+  });
+
+  it("emits native reasoning as signed Pi thinking before text", async () => {
+    const mockFetch = mockFetchOk(
+      '{"text":"Considering "}{"text":"options"}{"signature":"signed-reasoning"}{"content":"Final answer"}{"contextUsagePercentage":10}',
+    );
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(
+      streamKiro(makeModel({ id: "claude-opus-4-8", reasoning: true }), makeContext(), {
+        apiKey: "tok",
+        reasoning: "high",
+      }),
+    );
+
+    expect(events.map((event) => event.type)).toEqual(
+      expect.arrayContaining(["thinking_start", "thinking_delta", "thinking_end", "text_start", "text_delta"]),
+    );
+    const done = events.find((event) => event.type === "done");
+    const thinking =
+      done?.type === "done" ? done.message.content.find((block) => block.type === "thinking") : undefined;
+    expect(thinking).toMatchObject({
+      type: "thinking",
+      thinking: "Considering options",
+      thinkingSignature: "signed-reasoning",
+    });
+    vi.unstubAllGlobals();
+  });
+
   it("emits thinking_start -> thinking_delta -> thinking_end -> text_start -> text_delta -> text_end for reasoning model", async () => {
     const mockFetch = mockFetchChunked([
       '{"content":"<thinking>Let me think"}',
