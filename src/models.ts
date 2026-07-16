@@ -1,10 +1,13 @@
 // Feature 2: Model Definitions
 
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const CACHE_PATH = join(homedir(), ".kiro-models-cache.json");
+const CLI_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CLI_TIMEOUT_MS = 15_000;
 
 // Valid Kiro model IDs - API accepts friendly names directly
 export const KIRO_MODEL_IDS = new Set([
@@ -465,3 +468,96 @@ export const kiroModels = [
     maxTokens: 65536,
   },
 ];
+
+interface KiroCliModel {
+  model_id: string;
+  model_name: string;
+  context_window_tokens: number;
+}
+
+interface RefreshKiroModelsOptions {
+  cachePath?: string;
+  region: string;
+  runCli: () => string;
+}
+
+const DISCOVERED_MODEL_METADATA: Record<
+  string,
+  { maxTokens: number; reasoning: boolean; input: ("text" | "image")[] }
+> = {
+  "gpt-5-6-sol": { maxTokens: 128000, reasoning: true, input: ["text", "image"] },
+  "gpt-5-6-terra": { maxTokens: 128000, reasoning: true, input: ["text", "image"] },
+  "gpt-5-6-luna": { maxTokens: 128000, reasoning: true, input: ["text", "image"] },
+  "claude-sonnet-5": { maxTokens: 128000, reasoning: true, input: ["text", "image"] },
+  "claude-opus-4-5": { maxTokens: 65536, reasoning: true, input: ["text", "image"] },
+};
+
+export function refreshKiroModelsFromCli(options: RefreshKiroModelsOptions): boolean {
+  try {
+    const parsed = JSON.parse(options.runCli()) as { models?: KiroCliModel[] };
+    if (!Array.isArray(parsed.models) || parsed.models.length === 0) return false;
+
+    const region = options.region;
+    const baseUrl = `https://q.${region}.amazonaws.com/generateAssistantResponse`;
+    const models = parsed.models.map((model) => {
+      const id = model.model_id.replace(/(\d)\.(\d)/g, "$1-$2");
+      const existing = kiroModels.find((candidate) => candidate.id === id);
+      const metadata = DISCOVERED_MODEL_METADATA[id];
+      return {
+        id,
+        name: model.model_name || model.model_id,
+        api: "kiro-api" as const,
+        provider: "kiro" as const,
+        baseUrl,
+        reasoning: existing?.reasoning ?? metadata?.reasoning ?? false,
+        input: existing?.input ?? metadata?.input ?? (["text"] as ("text" | "image")[]),
+        cost: ZERO_COST,
+        contextWindow: model.context_window_tokens,
+        maxTokens: existing?.maxTokens ?? metadata?.maxTokens ?? 8192,
+      };
+    });
+
+    const cachePath = options.cachePath ?? CACHE_PATH;
+    let cache: Record<string, unknown> = {};
+    if (existsSync(cachePath)) {
+      try {
+        cache = JSON.parse(readFileSync(cachePath, "utf-8")) as Record<string, unknown>;
+      } catch {
+        cache = {};
+      }
+    }
+    cache[region] = models;
+    writeFileSync(cachePath, `${JSON.stringify(cache, null, 2)}\n`, "utf-8");
+    if (cachePath === CACHE_PATH) {
+      cachedIdsLoaded = false;
+      loadCachedModelIds();
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isKiroModelsCacheFresh(cachePath: string, region: string): boolean {
+  if (!existsSync(cachePath)) return false;
+  try {
+    const cache = JSON.parse(readFileSync(cachePath, "utf-8")) as Record<string, unknown>;
+    if (!Array.isArray(cache[region]) || cache[region].length === 0) return false;
+    return Date.now() - statSync(cachePath).mtimeMs < CLI_CACHE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+
+export function refreshStaleKiroModelsFromCli(region = "us-east-1"): boolean {
+  if (isKiroModelsCacheFresh(CACHE_PATH, region)) return false;
+
+  return refreshKiroModelsFromCli({
+    region,
+    runCli: () =>
+      execFileSync("kiro-cli", ["chat", "--list-models", "--format", "json"], {
+        encoding: "utf-8",
+        timeout: CLI_TIMEOUT_MS,
+      }),
+  });
+}

@@ -1,16 +1,43 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
-import { kiroModels } from "../src/models.js";
+import { getCachedModels, kiroModels } from "../src/models.js";
 
 const mockPi = () => {
   const registerProvider = vi.fn();
   return { pi: { registerProvider, on: vi.fn() } as unknown as ExtensionAPI, registerProvider };
 };
 
+const gptModel = {
+  ...kiroModels[0],
+  id: "gpt-5-6-sol",
+  name: "GPT-5.6 Sol",
+  contextWindow: 272000,
+  maxTokens: 128000,
+};
+
 describe("Feature 1: Extension Registration", () => {
   it("exports a default function", async () => {
     const mod = await import("../src/index.js");
     expect(typeof mod.default).toBe("function");
+  });
+
+  it("refreshes models before provider registration", async () => {
+    const mod = await import("../src/index.js");
+    const { pi, registerProvider } = mockPi();
+    const events: string[] = [];
+
+    await mod.initializeKiroProvider(pi, {
+      refreshModels: () => {
+        events.push("refresh");
+      },
+      getInitialModels: () => {
+        events.push("models");
+        return [gptModel];
+      },
+    });
+
+    expect(events).toEqual(["refresh", "models"]);
+    expect(registerProvider.mock.calls[0][1].models).toEqual([gptModel]);
   });
 
   it("calls registerProvider with 'kiro'", async () => {
@@ -23,13 +50,13 @@ describe("Feature 1: Extension Registration", () => {
     expect(registerProvider.mock.calls[0][0]).toBe("kiro");
   });
 
-  it("registers 15 models", async () => {
+  it("registers the startup model cache", async () => {
     const mod = await import("../src/index.js");
     const { pi, registerProvider } = mockPi();
     mod.default(pi);
 
     const config = registerProvider.mock.calls[0][1];
-    expect(config.models).toHaveLength(15);
+    expect(config.models).toEqual(getCachedModels("us-east-1"));
   });
 
   it("registers OAuth with name 'Kiro (Builder ID / Google / GitHub)'", async () => {

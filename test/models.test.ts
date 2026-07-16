@@ -1,7 +1,85 @@
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { filterModelsByRegion, KIRO_MODEL_IDS, kiroModels, resolveApiRegion, resolveKiroModel } from "../src/models.js";
+import {
+  filterModelsByRegion,
+  isKiroModelsCacheFresh,
+  KIRO_MODEL_IDS,
+  kiroModels,
+  refreshKiroModelsFromCli,
+  resolveApiRegion,
+  resolveKiroModel,
+} from "../src/models.js";
 
 describe("Feature 2: Model Definitions", () => {
+  describe("CLI model discovery", () => {
+    it("writes CLI-discovered GPT metadata to the regional cache", () => {
+      const cachePath = join(mkdtempSync(join(tmpdir(), "kiro-models-")), "cache.json");
+
+      const refreshed = refreshKiroModelsFromCli({
+        cachePath,
+        region: "us-east-1",
+        runCli: () =>
+          JSON.stringify({
+            models: [
+              {
+                model_id: "gpt-5.6-sol",
+                model_name: "GPT-5.6 Sol",
+                context_window_tokens: 272000,
+              },
+            ],
+          }),
+      });
+
+      expect(refreshed).toBe(true);
+      expect(JSON.parse(readFileSync(cachePath, "utf8"))).toEqual({
+        "us-east-1": [
+          expect.objectContaining({
+            id: "gpt-5-6-sol",
+            name: "GPT-5.6 Sol",
+            contextWindow: 272000,
+            maxTokens: 128000,
+            reasoning: true,
+            input: ["text", "image"],
+          }),
+        ],
+      });
+    });
+
+    it("preserves other regions when refreshing one regional cache", () => {
+      const cachePath = join(mkdtempSync(join(tmpdir(), "kiro-models-")), "cache.json");
+      writeFileSync(cachePath, JSON.stringify({ "eu-central-1": [{ id: "existing" }] }));
+
+      refreshKiroModelsFromCli({
+        cachePath,
+        region: "us-east-1",
+        runCli: () =>
+          JSON.stringify({
+            models: [{ model_id: "gpt-5.6-sol", model_name: "GPT-5.6 Sol", context_window_tokens: 272000 }],
+          }),
+      });
+
+      expect(JSON.parse(readFileSync(cachePath, "utf8"))["eu-central-1"]).toEqual([{ id: "existing" }]);
+    });
+
+    it("treats a fresh cache missing the requested region as stale", () => {
+      const cachePath = join(mkdtempSync(join(tmpdir(), "kiro-models-")), "cache.json");
+      writeFileSync(cachePath, JSON.stringify({ "eu-central-1": [{ id: "existing" }] }));
+
+      expect(isKiroModelsCacheFresh(cachePath, "us-east-1")).toBe(false);
+    });
+
+    it("fails open without overwriting cache when CLI output is invalid", () => {
+      const cachePath = join(mkdtempSync(join(tmpdir(), "kiro-models-")), "cache.json");
+      const existing = JSON.stringify({ "us-east-1": [{ id: "existing" }] });
+      writeFileSync(cachePath, existing);
+
+      expect(refreshKiroModelsFromCli({ cachePath, region: "us-east-1", runCli: () => "not json" })).toBe(false);
+      expect(readFileSync(cachePath, "utf8")).toBe(existing);
+    });
+  });
+
   describe("resolveKiroModel", () => {
     it.each([
       // Claude models - dash to dot conversion

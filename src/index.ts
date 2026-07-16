@@ -6,7 +6,8 @@ import type { Api, Model, OAuthCredentials } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getKiroCliCredentials } from "./kiro-cli.js";
 import { setExtensionContext } from "./login-ui.js";
-import { getCachedModels, kiroModels, resolveApiRegion } from "./models.js";
+import type { kiroModels } from "./models.js";
+import { getCachedModels, refreshStaleKiroModelsFromCli, resolveApiRegion } from "./models.js";
 import type { KiroCredentials } from "./oauth.js";
 import { loginKiro, refreshKiroToken } from "./oauth.js";
 import { streamKiro } from "./stream.js";
@@ -16,7 +17,23 @@ export type { KiroStreamEvent } from "./event-parser.js";
 export { KIRO_MODEL_IDS, kiroModels, resolveApiRegion, resolveKiroModel } from "./models.js";
 export { streamKiro } from "./stream.js";
 
-export default function (pi: ExtensionAPI) {
+interface KiroProviderDependencies {
+  refreshModels: () => void;
+  getInitialModels: () => typeof kiroModels;
+}
+
+const DEFAULT_DEPENDENCIES: KiroProviderDependencies = {
+  refreshModels: refreshStaleKiroModelsFromCli,
+  getInitialModels: () => getCachedModels("us-east-1"),
+};
+
+export function initializeKiroProvider(
+  pi: ExtensionAPI,
+  dependencies: KiroProviderDependencies = DEFAULT_DEPENDENCIES,
+): void {
+  dependencies.refreshModels();
+  const initialModels = dependencies.getInitialModels();
+
   // Capture ctx for the custom TUI login component
   pi.on("session_start", async (_event, ctx) => {
     setExtensionContext(ctx);
@@ -24,7 +41,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerProvider("kiro", {
     baseUrl: "https://q.us-east-1.amazonaws.com/generateAssistantResponse",
     api: "kiro-api",
-    models: kiroModels,
+    models: initialModels,
     oauth: {
       // Name reflects all supported auth methods: AWS Builder ID, Google, GitHub
       name: "Kiro (Builder ID / Google / GitHub)",
@@ -48,4 +65,8 @@ export default function (pi: ExtensionAPI) {
     } as any,
     streamSimple: streamKiro,
   });
+}
+
+export default function (pi: ExtensionAPI): void {
+  initializeKiroProvider(pi);
 }
