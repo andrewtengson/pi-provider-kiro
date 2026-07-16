@@ -814,8 +814,8 @@ describe("Feature 9: Streaming Integration", () => {
     // Verify tool results were sent in the request body
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     const currentMsg = body.conversationState.currentMessage.userInputMessage;
-    expect(currentMsg.content).toContain("Tool results provided.");
-    expect(currentMsg.content).toContain("If work remains, invoke a tool in this response");
+    expect(currentMsg.content).toBe("Tool results provided.");
+    expect(JSON.stringify(body.conversationState.history)).toContain("If work remains, invoke a tool in this response");
     expect(currentMsg.userInputMessageContext?.toolResults).toHaveLength(1);
     expect(currentMsg.userInputMessageContext.toolResults[0].toolUseId).toBe("tc1");
 
@@ -2009,7 +2009,7 @@ describe("Feature 9: Streaming Integration", () => {
   // Tool-turn completion contract
   // =========================================================================
 
-  it("adds a recent completion contract when tools are available", async () => {
+  it("adds the completion contract to provider system instructions when tools are available", async () => {
     const mockFetch = mockFetchOk('{"content":"Done."}{"contextUsagePercentage":10}');
     vi.stubGlobal("fetch", mockFetch);
 
@@ -2021,9 +2021,9 @@ describe("Feature 9: Streaming Integration", () => {
 
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     const content = body.conversationState.currentMessage.userInputMessage.content as string;
-    expect(content).toContain("Hello");
-    expect(content).toContain("If work remains, invoke a tool in this response");
+    expect(content).toContain("You are helpful\n\nIf work remains, invoke a tool in this response");
     expect(content).toContain("Return text-only only when the user’s task is complete");
+    expect(content).toContain("\n\nHello");
     expect(mockFetch).toHaveBeenCalledOnce();
 
     vi.unstubAllGlobals();
@@ -2038,6 +2038,47 @@ describe("Feature 9: Streaming Integration", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     const content = body.conversationState.currentMessage.userInputMessage.content as string;
     expect(content).not.toContain("If work remains, invoke a tool in this response");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("stops a pathological whitespace run before it bloats session history", async () => {
+    const mockFetch = mockFetchOk(`{"content":"Started.${" ".repeat(10_000)}g"}`);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
+    const deltas = events
+      .filter((event) => event.type === "text_delta")
+      .map((event) => (event as { delta: string }).delta)
+      .join("");
+    const error = events.find((event) => event.type === "error");
+
+    expect(deltas.length).toBeLessThan(5_000);
+    expect(deltas).not.toContain("g");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("runaway whitespace");
+    expect(mockFetch).toHaveBeenCalledOnce();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("tracks runaway whitespace across separate content events", async () => {
+    const mockFetch = mockFetchChunked([
+      `{"content":"Started.${" ".repeat(3_000)}"}`,
+      `{"content":"${" ".repeat(3_000)}g"}`,
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
+    const deltas = events
+      .filter((event) => event.type === "text_delta")
+      .map((event) => (event as { delta: string }).delta)
+      .join("");
+    const error = events.find((event) => event.type === "error");
+
+    expect(deltas.startsWith("Started.")).toBe(true);
+    expect(deltas.length).toBeLessThanOrEqual(4_096 + "Started.".length);
+    expect(deltas).not.toContain("g");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("runaway whitespace");
 
     vi.unstubAllGlobals();
   });

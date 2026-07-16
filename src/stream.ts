@@ -59,6 +59,7 @@ const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
 const TOOL_TURN_CONTRACT =
   "If work remains, invoke a tool in this response. Do not end with only a progress update. Return text-only only when the user’s task is complete.";
+const MAX_CONSECUTIVE_WHITESPACE = 4096;
 
 const eventStreamMarshaller = new UniversalEventStreamMarshaller({
   utf8Encoder: (input: Uint8Array) => new TextDecoder().decode(input),
@@ -283,6 +284,10 @@ export function streamKiro(
                 : 10000;
         systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${systemPrompt ? `\n${systemPrompt}` : ""}`;
       }
+      const baseTools = context.tools?.length ? convertToolsToKiro(context.tools) : [];
+      if (baseTools.length > 0) {
+        systemPrompt = systemPrompt ? `${systemPrompt}\n\n${TOOL_TURN_CONTRACT}` : TOOL_TURN_CONTRACT;
+      }
       let retryCount = 0;
       const maxRetries = 3;
       const conversationId = options?.sessionId ?? crypto.randomUUID();
@@ -403,11 +408,7 @@ export function streamKiro(
         // declares no current tools is rejected by Kiro as "Improperly formed
         // request" because history references toolUses with no tool catalog.
         let uimc: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] } | undefined;
-        const baseTools = context.tools?.length ? convertToolsToKiro(context.tools) : [];
         const finalTools = history.length > 0 ? addPlaceholderTools(baseTools, history) : baseTools;
-        if (baseTools.length > 0) {
-          currentContent = `${currentContent}\n\n${TOOL_TURN_CONTRACT}`;
-        }
         if (currentToolResults.length > 0 || finalTools.length > 0) {
           uimc = {};
           if (currentToolResults.length > 0) uimc.toolResults = currentToolResults;
@@ -546,6 +547,7 @@ export function streamKiro(
         const bodyReader = (response.body as unknown as ReadableStream<Uint8Array>).getReader();
         let totalContent = "";
         let lastContentData = "";
+        let consecutiveWhitespace = 0;
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
         let receivedContextUsage = false;
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
@@ -679,17 +681,43 @@ export function streamKiro(
               finishNativeReasoning();
               if (event.data === lastContentData) continue;
               lastContentData = event.data;
-              totalContent += event.data;
-              if (thinkingParser) {
-                thinkingParser.processChunk(event.data);
-              } else {
-                if (textBlockIndex === null) {
-                  textBlockIndex = output.content.length;
-                  output.content.push({ type: "text", text: "" });
-                  stream.push({ type: "text_start", contentIndex: textBlockIndex, partial: output });
+
+              let whitespaceRunStart = consecutiveWhitespace > 0 ? 0 : -1;
+              let runawayWhitespace = false;
+              for (let index = 0; index < event.data.length; index++) {
+                if (/\s/.test(event.data[index] ?? "")) {
+                  if (whitespaceRunStart < 0) whitespaceRunStart = index;
+                  consecutiveWhitespace++;
+                  if (consecutiveWhitespace > MAX_CONSECUTIVE_WHITESPACE) {
+                    runawayWhitespace = true;
+                    break;
+                  }
+                } else {
+                  consecutiveWhitespace = 0;
+                  whitespaceRunStart = -1;
                 }
-                (output.content[textBlockIndex] as TextContent).text += event.data;
-                stream.push({ type: "text_delta", contentIndex: textBlockIndex, delta: event.data, partial: output });
+              }
+              const content = runawayWhitespace ? event.data.slice(0, Math.max(0, whitespaceRunStart)) : event.data;
+              if (content) {
+                totalContent += content;
+                if (thinkingParser) {
+                  thinkingParser.processChunk(content);
+                } else {
+                  if (textBlockIndex === null) {
+                    textBlockIndex = output.content.length;
+                    output.content.push({ type: "text", text: "" });
+                    stream.push({ type: "text_start", contentIndex: textBlockIndex, partial: output });
+                  }
+                  (output.content[textBlockIndex] as TextContent).text += content;
+                  stream.push({ type: "text_delta", contentIndex: textBlockIndex, delta: content, partial: output });
+                }
+              }
+              if (runawayWhitespace) {
+                const cancelReader = (bodyReader as { cancel?: () => Promise<unknown> }).cancel;
+                if (cancelReader) void cancelReader.call(bodyReader).catch(() => {});
+                throw new Error(
+                  `Kiro API stream aborted after runaway whitespace exceeded ${MAX_CONSECUTIVE_WHITESPACE} consecutive characters`,
+                );
               }
               break;
             }
