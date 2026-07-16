@@ -56,6 +56,15 @@ import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js
 
 const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
+const CONTINUATION_INSTRUCTION =
+  "Continue the unfinished work now. Do not only describe the next step: perform it using tools when needed, then return the completed result.";
+
+function promisesImmediateWork(text: string): boolean {
+  const progressivePlan = /\bI(?:['’]m| am)\s+\w+ing\b[\s\S]{0,400}\b(?:then|before|first|and will)\b/i;
+  const explicitPlan = /\bI(?:['’]ll| will)\s+(?:first\s+)?\w+/i;
+  const nextStep = /(?:^|[.!?]\s+)Next (?:step|validation|check|test|action)\s*:/i;
+  return progressivePlan.test(text) || explicitPlan.test(text) || nextStep.test(text);
+}
 
 const eventStreamMarshaller = new UniversalEventStreamMarshaller({
   utf8Encoder: (input: Uint8Array) => new TextDecoder().decode(input),
@@ -275,6 +284,8 @@ export function streamKiro(
         systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${systemPrompt ? `\n${systemPrompt}` : ""}`;
       }
       let retryCount = 0;
+      let continuationAttempted = false;
+      let interruptedProgress = "";
       const maxRetries = 3;
       const conversationId = options?.sessionId ?? crypto.randomUUID();
       while (retryCount <= maxRetries) {
@@ -374,6 +385,9 @@ export function streamKiro(
           currentContent = typeof firstMsg.content === "string" ? firstMsg.content : getContentText(firstMsg);
           if (effectiveSystemPrompt && !systemPrepended)
             currentContent = `${effectiveSystemPrompt}\n\n${currentContent}`;
+        }
+        if (interruptedProgress) {
+          currentContent = `${CONTINUATION_INSTRUCTION}\n\nThe interrupted response was:\n${interruptedProgress}`;
         }
         // Prepend truncation notice if the previous assistant response was cut off
         if (wasPreviousResponseTruncated(context.messages)) {
@@ -574,12 +588,16 @@ export function streamKiro(
           try {
             if (!gotFirstToken) {
               const readPromise = iterator.next();
-              const result = await Promise.race([
-                readPromise,
-                new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) =>
-                  setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), firstTokenTimeoutForModel(model.id)),
-                ),
-              ]);
+              let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+              const timeoutPromise = new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
+                firstTokenTimer = setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), firstTokenTimeoutForModel(model.id));
+              });
+              let result: IteratorResult<Record<string, unknown>> | typeof FIRST_TOKEN_SENTINEL;
+              try {
+                result = await Promise.race([readPromise, timeoutPromise]);
+              } finally {
+                if (firstTokenTimer) clearTimeout(firstTokenTimer);
+              }
               if (result === FIRST_TOKEN_SENTINEL) {
                 readPromise.catch(() => {}); // suppress dangling rejection
                 void bodyReader.cancel().catch(() => {});
@@ -721,6 +739,23 @@ export function streamKiro(
           if (/^\s*(\.+|continue)\s*$/i.test(textBlock.text)) {
             textBlock.text = "";
           }
+        }
+        // Kiro occasionally ends a turn after a progress preamble without a
+        // tool call. Retry exactly once only when the response explicitly
+        // promises immediate implementation work. Genuine final prose and a
+        // second interrupted response remain terminal.
+        const completedText = textBlockIndex !== null ? (output.content[textBlockIndex] as TextContent).text : "";
+        if (
+          emittedToolCalls === 0 &&
+          receivedContextUsage &&
+          !continuationAttempted &&
+          promisesImmediateWork(completedText)
+        ) {
+          continuationAttempted = true;
+          interruptedProgress = completedText;
+          output.content = [];
+          textBlockIndex = null;
+          continue;
         }
         if (textBlockIndex !== null)
           stream.push({

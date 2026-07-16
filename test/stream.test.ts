@@ -80,9 +80,9 @@ function encodeBody(body: string): Uint8Array {
   return concatMessages(...parseJsonObjects(body).map((o) => encodeEventMessage(o)));
 }
 
-function mockFetchOk(body: string) {
+function makeFetchResponse(body: string) {
   const frames = encodeBody(body);
-  return vi.fn().mockResolvedValueOnce({
+  return {
     ok: true,
     body: {
       getReader: () => ({
@@ -94,7 +94,11 @@ function mockFetchOk(body: string) {
       }),
       cancel: async () => {},
     },
-  });
+  };
+}
+
+function mockFetchOk(body: string) {
+  return vi.fn().mockResolvedValueOnce(makeFetchResponse(body));
 }
 
 function mockFetchChunked(chunks: string[]) {
@@ -1396,6 +1400,28 @@ describe("Feature 9: Streaming Integration", () => {
   // First-token timeout (Task 1.2)
   // =========================================================================
 
+  it("clears the first-token timeout after a successful first event", async () => {
+    const originalTimeout = retryConfig.firstTokenTimeoutMs;
+    retryConfig.firstTokenTimeoutMs = 90_000;
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    await collect(stream);
+
+    const firstTokenTimerIndex = setTimeoutSpy.mock.calls.findIndex((call) => call[1] === 90_000);
+    expect(firstTokenTimerIndex).toBeGreaterThanOrEqual(0);
+    const firstTokenTimer = setTimeoutSpy.mock.results[firstTokenTimerIndex]?.value;
+    expect(clearTimeoutSpy).toHaveBeenCalledWith(firstTokenTimer);
+
+    setTimeoutSpy.mockRestore();
+    clearTimeoutSpy.mockRestore();
+    retryConfig.firstTokenTimeoutMs = originalTimeout;
+    vi.unstubAllGlobals();
+  });
+
   it("retries when first token times out then succeeds on second attempt", async () => {
     const originalTimeout = retryConfig.firstTokenTimeoutMs;
     retryConfig.firstTokenTimeoutMs = 100;
@@ -1931,6 +1957,90 @@ describe("Feature 9: Streaming Integration", () => {
     const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
     expect(toolCalls).toHaveLength(1);
     expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].name).toBe("bash");
+
+    vi.unstubAllGlobals();
+  });
+
+  // =========================================================================
+  // Premature text-only stop recovery
+  // =========================================================================
+
+  it("continues once when a text-only response explicitly promises more work", async () => {
+    const progressResponse =
+      '{"content":"I’ll inspect the source, then implement the fix."}{"contextUsagePercentage":10}';
+    const finalResponse = '{"content":"Implemented and verified the fix."}{"contextUsagePercentage":10}';
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeFetchResponse(progressResponse))
+      .mockResolvedValueOnce(makeFetchResponse(finalResponse));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const secondRequest = JSON.parse(mockFetch.mock.calls[1][1].body);
+    expect(secondRequest.conversationState.currentMessage.userInputMessage.content).toContain(
+      "Continue the unfinished work now",
+    );
+    const done = events.find((event) => event.type === "done");
+    expect(
+      done?.type === "done" &&
+        done.message.content.some(
+          (block) => block.type === "text" && (block as TextContent).text === "Implemented and verified the fix.",
+        ),
+    ).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    "Red test confirmed. I’m correcting the assertion, expecting the same failure, then implementing cleanup.",
+    "I’m folding the continuation guard into the fork migration. First red tests: promise-to-act retries once.",
+    "The guard is not loaded yet, so I’m verifying Pi’s local-package syntax before changing settings.",
+    "The fork is active. Next validation: time pi -p and inspect the trace.",
+    "Agreed. I’ll port native reasoning into source, rebuild, and validate dist.",
+  ])("continues observed interrupted GPT response: %s", async (progressText) => {
+    const progressResponse = `${JSON.stringify({ content: progressText })}{"contextUsagePercentage":10}`;
+    const finalResponse = '{"content":"Completed the promised work."}{"contextUsagePercentage":10}';
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeFetchResponse(progressResponse))
+      .mockResolvedValueOnce(makeFetchResponse(finalResponse));
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    vi.unstubAllGlobals();
+  });
+
+  it("does not continue a genuine text-only final answer", async () => {
+    const mockFetch = mockFetchOk('{"content":"Implemented and verified the fix."}{"contextUsagePercentage":10}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(events.find((event) => event.type === "done")).toBeDefined();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("continues a promised-action response at most once", async () => {
+    const firstProgress = '{"content":"I’ll inspect the source, then implement the fix."}{"contextUsagePercentage":10}';
+    const secondProgress =
+      '{"content":"I will check another file and then make the change."}{"contextUsagePercentage":10}';
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeFetchResponse(firstProgress))
+      .mockResolvedValueOnce(makeFetchResponse(secondProgress));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const done = events.find((event) => event.type === "done");
+    expect(done?.type === "done" && done.message.stopReason).toBe("stop");
 
     vi.unstubAllGlobals();
   });
