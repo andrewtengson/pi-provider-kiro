@@ -57,8 +57,6 @@ import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js
 
 const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
-const TOOL_TURN_CONTRACT =
-  "If work remains, invoke a tool in this response. Do not end with only a progress update. Return text-only only when the user’s task is complete.";
 const MAX_CONSECUTIVE_WHITESPACE = 4096;
 
 const eventStreamMarshaller = new UniversalEventStreamMarshaller({
@@ -285,10 +283,8 @@ export function streamKiro(
         systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${systemPrompt ? `\n${systemPrompt}` : ""}`;
       }
       const baseTools = context.tools?.length ? convertToolsToKiro(context.tools) : [];
-      if (baseTools.length > 0) {
-        systemPrompt = systemPrompt ? `${systemPrompt}\n\n${TOOL_TURN_CONTRACT}` : TOOL_TURN_CONTRACT;
-      }
       let retryCount = 0;
+      let truncatedTextRetryAttempted = false;
       const maxRetries = 3;
       const conversationId = options?.sessionId ?? crypto.randomUUID();
       while (retryCount <= maxRetries) {
@@ -813,6 +809,17 @@ export function streamKiro(
             textBlock.text = "";
           }
         }
+        const hasText = textBlockIndex !== null && (output.content[textBlockIndex] as TextContent).text.length > 0;
+        const truncatedTextOnly = hasText && !receivedContextUsage && !sawAnyToolCalls;
+        if (truncatedTextOnly && !truncatedTextRetryAttempted) {
+          truncatedTextRetryAttempted = true;
+          debugLog("response.truncated_text_retry", {
+            textLen: (output.content[textBlockIndex as number] as TextContent).text.length,
+          });
+          output.content = [];
+          textBlockIndex = null;
+          continue;
+        }
         if (textBlockIndex !== null)
           stream.push({
             type: "text_end",
@@ -852,7 +859,6 @@ export function streamKiro(
         // input), don't retry — the API did respond, it just sent malformed
         // tool calls. Retrying would likely produce the same result. The
         // stopReason fix below prevents the agent loop stall.
-        const hasText = textBlockIndex !== null && (output.content[textBlockIndex] as TextContent).text.length > 0;
         const responseText = hasText ? (output.content[textBlockIndex as number] as TextContent).text : "";
         const isEchoLoop = hasText && !sawAnyToolCalls && /^\s*(continue|\.+)\s*$/i.test(responseText);
         if ((!hasText && !sawAnyToolCalls) || isEchoLoop) {

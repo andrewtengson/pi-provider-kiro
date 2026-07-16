@@ -29,8 +29,8 @@ describe("Feature 2: Model Definitions", () => {
   });
 
   describe("KIRO_MODEL_IDS", () => {
-    it("contains 14 model IDs", () => {
-      expect(KIRO_MODEL_IDS.size).toBe(14);
+    it("contains 19 model IDs", () => {
+      expect(KIRO_MODEL_IDS.size).toBe(19);
     });
   });
 
@@ -75,8 +75,8 @@ describe("Feature 2: Model Definitions", () => {
   });
 
   describe("model catalog", () => {
-    it("defines 14 models", () => {
-      expect(kiroModels).toHaveLength(14);
+    it("defines 15 models", () => {
+      expect(kiroModels).toHaveLength(15);
     });
 
     it("claude-haiku-4-5 has reasoning=false", () => {

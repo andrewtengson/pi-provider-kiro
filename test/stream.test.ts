@@ -815,7 +815,6 @@ describe("Feature 9: Streaming Integration", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     const currentMsg = body.conversationState.currentMessage.userInputMessage;
     expect(currentMsg.content).toBe("Tool results provided.");
-    expect(JSON.stringify(body.conversationState.history)).toContain("If work remains, invoke a tool in this response");
     expect(currentMsg.userInputMessageContext?.toolResults).toHaveLength(1);
     expect(currentMsg.userInputMessageContext.toolResults[0].toolUseId).toBe("tc1");
 
@@ -1900,17 +1899,47 @@ describe("Feature 9: Streaming Integration", () => {
   // Truncation recovery (Task 4.1)
   // =========================================================================
 
-  it("sets stopReason to length when stream ends without contextUsage event", async () => {
-    // Stream that ends without contextUsagePercentage event
-    const mockFetch = mockFetchOk('{"content":"partial response that got cut off"}');
+  it("retries once when text-only output ends without contextUsage", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeFetchResponse('{"content":"partial progress"}'))
+      .mockResolvedValueOnce(
+        makeFetchResponse(
+          '{"name":"bash","toolUseId":"tc1","input":"{\\"command\\":\\"pwd\\"}","stop":true}{"contextUsagePercentage":10}',
+        ),
+      );
     vi.stubGlobal("fetch", mockFetch);
 
-    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
-    const events = await collect(stream);
+    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
 
-    const done = events.find((e) => e.type === "done");
-    expect(done).toBeDefined();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(done?.type === "done" && done.message.stopReason).toBe("toolUse");
+    expect(done?.type === "done" && done.message.content.some((block) => block.type === "toolCall")).toBe(true);
+    expect(
+      done?.type === "done" &&
+        done.message.content.some((block) => block.type === "text" && block.text.includes("partial progress")),
+    ).toBe(false);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("returns length after one retry when text-only truncation persists", async () => {
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeFetchResponse('{"content":"first partial"}'))
+      .mockResolvedValueOnce(makeFetchResponse('{"content":"second partial"}'));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
+    const done = events.find((event) => event.type === "done");
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
     expect(done?.type === "done" && done.message.stopReason).toBe("length");
+    expect(
+      done?.type === "done" &&
+        done.message.content.some((block) => block.type === "text" && block.text === "second partial"),
+    ).toBe(true);
 
     vi.unstubAllGlobals();
   });
@@ -2001,43 +2030,6 @@ describe("Feature 9: Streaming Integration", () => {
     const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
     expect(toolCalls).toHaveLength(1);
     expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].name).toBe("bash");
-
-    vi.unstubAllGlobals();
-  });
-
-  // =========================================================================
-  // Tool-turn completion contract
-  // =========================================================================
-
-  it("adds the completion contract to provider system instructions when tools are available", async () => {
-    const mockFetch = mockFetchOk('{"content":"Done."}{"contextUsagePercentage":10}');
-    vi.stubGlobal("fetch", mockFetch);
-
-    const context: Context = {
-      ...makeContext(),
-      tools: [{ name: "bash", description: "Run a command", parameters: { type: "object", properties: {} } }],
-    };
-    await collect(streamKiro(makeModel({ reasoning: false }), context, { apiKey: "tok" }));
-
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    const content = body.conversationState.currentMessage.userInputMessage.content as string;
-    expect(content).toContain("You are helpful\n\nIf work remains, invoke a tool in this response");
-    expect(content).toContain("Return text-only only when the user’s task is complete");
-    expect(content).toContain("\n\nHello");
-    expect(mockFetch).toHaveBeenCalledOnce();
-
-    vi.unstubAllGlobals();
-  });
-
-  it("does not add the completion contract when no tools are available", async () => {
-    const mockFetch = mockFetchOk('{"content":"Done."}{"contextUsagePercentage":10}');
-    vi.stubGlobal("fetch", mockFetch);
-
-    await collect(streamKiro(makeModel({ reasoning: false }), { ...makeContext(), tools: [] }, { apiKey: "tok" }));
-
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    const content = body.conversationState.currentMessage.userInputMessage.content as string;
-    expect(content).not.toContain("If work remains, invoke a tool in this response");
 
     vi.unstubAllGlobals();
   });
