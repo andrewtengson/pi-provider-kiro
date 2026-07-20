@@ -601,8 +601,9 @@ export function streamKiro(
         };
         const utf8Decoder = new TextDecoder();
         const eventStream = eventStreamMarshaller.deserialize(bodyIterable, async (event: Record<string, Message>) => {
-          const key = Object.keys(event)[0]!;
-          const msg = event[key]!;
+          const entry = Object.entries(event)[0];
+          if (!entry) throw new Error("Kiro stream event had no payload");
+          const [key, msg] = entry;
           const parsed = JSON.parse(utf8Decoder.decode(msg.body)) as Record<string, unknown>;
           return { [key]: parsed } as Record<string, unknown>;
         });
