@@ -247,18 +247,20 @@ describe("Feature 2: Model Definitions", () => {
 
   describe("bootstrap model catalog", () => {
     it("keeps conservative, zero-cost bootstrap metadata", () => {
-      expect(kiroModels).toHaveLength(15);
+      expect(kiroModels).toHaveLength(18);
       expect(kiroModels.every((model) => model.baseUrl === "https://runtime.us-east-1.kiro.dev/")).toBe(true);
       expect(kiroModels.every((model) => model.cost.input === 0 && model.cost.output === 0)).toBe(true);
       expect(kiroModels.find((model) => model.id === "claude-haiku-4-5")?.reasoning).toBe(false);
       expect(kiroModels.find((model) => model.id === "minimax-m2-1")?.reasoning).toBe(false);
     });
 
-    it("uses image input for Claude and text input for other concrete models", () => {
-      const claudeModels = kiroModels.filter((model) => model.id.startsWith("claude-"));
-      const nonClaudeModels = kiroModels.filter((model) => !model.id.startsWith("claude-") && model.id !== "auto");
-      expect(claudeModels.every((model) => model.input.includes("text") && model.input.includes("image"))).toBe(true);
-      expect(nonClaudeModels.every((model) => model.input.length === 1 && model.input[0] === "text")).toBe(true);
+    it("uses image input for Claude and GPT, and text input for other concrete models", () => {
+      const imageModels = kiroModels.filter((model) => model.id.startsWith("claude-") || model.id.startsWith("gpt-"));
+      const textOnlyModels = kiroModels.filter(
+        (model) => !model.id.startsWith("claude-") && !model.id.startsWith("gpt-") && model.id !== "auto",
+      );
+      expect(imageModels.every((model) => model.input.includes("text") && model.input.includes("image"))).toBe(true);
+      expect(textOnlyModels.every((model) => model.input.length === 1 && model.input[0] === "text")).toBe(true);
     });
   });
 
@@ -266,7 +268,15 @@ describe("Feature 2: Model Definitions", () => {
     const THROUGH_HIGH = ["off", "minimal", "low", "medium", "high"] satisfies ModelThinkingLevel[];
     const THROUGH_XHIGH_AND_MAX = [...THROUGH_HIGH, "xhigh", "max"] satisfies ModelThinkingLevel[];
     const THROUGH_HIGH_AND_MAX = [...THROUGH_HIGH, "max"] satisfies ModelThinkingLevel[];
-    const XHIGH_AND_MAX_MODELS = ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5", "claude-fable-5"];
+    const XHIGH_AND_MAX_MODELS = [
+      "claude-opus-4-8",
+      "claude-opus-4-7",
+      "claude-sonnet-5",
+      "claude-fable-5",
+      "gpt-5-6-sol",
+      "gpt-5-6-terra",
+      "gpt-5-6-luna",
+    ];
     const MAX_WITHOUT_XHIGH_MODELS = ["claude-opus-4-6", "claude-sonnet-4-6"];
 
     it("advertises xhigh and max only when both are mapped", () => {
