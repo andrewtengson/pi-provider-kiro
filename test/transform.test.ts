@@ -1,4 +1,11 @@
-import type { AssistantMessage, Message, Tool, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import type {
+  AssistantMessage,
+  Message,
+  ThinkingContent,
+  Tool,
+  ToolResultMessage,
+  UserMessage,
+} from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
   buildHistory,
