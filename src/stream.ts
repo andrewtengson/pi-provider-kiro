@@ -540,6 +540,9 @@ export function streamKiro(
         let consecutiveWhitespace = 0;
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
         let receivedContextUsage = false;
+        // Debug-only: ordered trace of raw frame keys and parsed event types to
+        // diagnose premature stops (e.g. tool preamble text with no toolUse frame).
+        const frameTrace: string[] = [];
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
         let nativeReasoningActive = false;
         let nativeReasoningSignature: string | undefined;
@@ -648,9 +651,23 @@ export function streamKiro(
           if (done) break;
           resetIdle();
           const eventPayload = Object.values(value as Record<string, unknown>)[0] as Record<string, unknown>;
+          const rawFrameKey = debugEnabled() ? (Object.keys(value as Record<string, unknown>)[0] ?? "?") : "";
           const event = parseKiroEvent(eventPayload);
-          if (!event) continue;
-          if (debugEnabled()) debugLog("stream.events", [event]);
+          if (!event) {
+            if (debugEnabled()) {
+              frameTrace.push(`${rawFrameKey}:UNPARSED`);
+              debugLog("stream.unparsed_frame", {
+                key: rawFrameKey,
+                payloadKeys: Object.keys(eventPayload),
+                stopReason: typeof eventPayload.stopReason === "string" ? eventPayload.stopReason : undefined,
+              });
+            }
+            continue;
+          }
+          if (debugEnabled()) {
+            frameTrace.push(`${rawFrameKey}:${event.type}`);
+            debugLog("stream.events", [event]);
+          }
           switch (event.type) {
             case "contextUsage": {
               const pct = event.data.contextUsagePercentage;
@@ -896,6 +913,10 @@ export function streamKiro(
           stopReason: output.stopReason,
           emittedToolCalls,
           sawAnyToolCalls,
+          receivedContextUsage,
+          frameTrace,
+          lastFrame: frameTrace[frameTrace.length - 1] ?? null,
+          textTail: textBlockIndex !== null ? (output.content[textBlockIndex] as TextContent).text.slice(-200) : null,
           textLen: textBlockIndex !== null ? (output.content[textBlockIndex] as TextContent).text.length : 0,
           usage: output.usage,
           content: output.content,
