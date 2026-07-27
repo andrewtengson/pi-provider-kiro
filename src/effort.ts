@@ -7,11 +7,13 @@ export type KiroEffortField = "reasoning" | "output_config";
 export interface KiroEffortConfig {
   field: KiroEffortField;
   values: readonly string[];
+  /** True when the model's schema offers `thinking.display: "summarized"`. */
+  summarizedThinking: boolean;
 }
 
 export type KiroAdditionalModelRequestFields =
   | { reasoning: { effort: string } }
-  | { output_config: { effort: string }; thinking: { type: "adaptive"; display: "summarized" } };
+  | { output_config: { effort: string }; thinking: { type: "adaptive"; display?: "summarized" } };
 
 type ModelWithKiroEffortMetadata = Model<Api> & {
   additionalModelRequestFieldsSchema?: unknown;
@@ -35,7 +37,13 @@ export function deriveKiroEffort(schema: unknown): KiroEffortConfig | undefined 
     if (!isRecord(effortSchema) || !Array.isArray(effortSchema.enum) || effortSchema.enum.length === 0) continue;
     if (!effortSchema.enum.every((value) => typeof value === "string" && value.length > 0)) continue;
 
-    return { field, values: [...new Set(effortSchema.enum as string[])] };
+    const thinkingSchema = schema.properties.thinking;
+    const displaySchema =
+      isRecord(thinkingSchema) && isRecord(thinkingSchema.properties) ? thinkingSchema.properties.display : undefined;
+    const summarizedThinking =
+      isRecord(displaySchema) && Array.isArray(displaySchema.enum) && displaySchema.enum.includes("summarized");
+
+    return { field, values: [...new Set(effortSchema.enum as string[])], summarizedThinking };
   }
 
   return undefined;
@@ -66,10 +74,14 @@ export function fallbackKiroEffort(
   if (map?.max) extras.push("max");
 
   if (normalizedId.startsWith("openai-gpt") || normalizedId.startsWith("gpt")) {
-    return { field: "reasoning", values: ["low", "medium", "high", ...(extras.length > 0 ? extras : ["xhigh"])] };
+    return {
+      field: "reasoning",
+      values: ["low", "medium", "high", ...(extras.length > 0 ? extras : ["xhigh"])],
+      summarizedThinking: false,
+    };
   }
   if (normalizedId.startsWith("claude") && extras.length > 0) {
-    return { field: "output_config", values: ["low", "medium", "high", ...extras] };
+    return { field: "output_config", values: ["low", "medium", "high", ...extras], summarizedThinking: true };
   }
   return undefined;
 }
@@ -132,10 +144,14 @@ export function buildKiroAdditionalModelRequestFields(
   const effort = mapPiLevelToKiroEffort(model, level, config);
   if (!effort) return undefined;
 
-  // `display: "summarized"` is required: Kiro defaults thinking.display to
-  // "omitted", which suppresses every reasoningContentEvent even when adaptive
-  // thinking is enabled. Verified live on claude-opus-5 and claude-opus-4.8.
+  // Kiro defaults thinking.display to "omitted", which suppresses every
+  // reasoningContentEvent even with adaptive thinking enabled. Send
+  // display: "summarized" only when the model's schema advertises it.
+  // Verified live on claude-opus-5 and claude-opus-4.8.
   return config.field === "output_config"
-    ? { output_config: { effort }, thinking: { type: "adaptive", display: "summarized" } }
+    ? {
+        output_config: { effort },
+        thinking: { type: "adaptive", ...(config.summarizedThinking ? { display: "summarized" as const } : {}) },
+      }
     : { reasoning: { effort } };
 }

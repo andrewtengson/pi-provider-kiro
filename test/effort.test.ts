@@ -37,10 +37,12 @@ describe("effort schema derivation", () => {
     expect(deriveKiroEffort(schema("reasoning", ["low", "high", "xhigh"]))).toEqual({
       field: "reasoning",
       values: ["low", "high", "xhigh"],
+      summarizedThinking: false,
     });
     expect(deriveKiroEffort(schema("output_config", ["low", "max"]))).toEqual({
       field: "output_config",
       values: ["low", "max"],
+      summarizedThinking: false,
     });
   });
 
@@ -55,6 +57,7 @@ describe("effort fallback derived from thinkingLevelMap", () => {
     expect(fallbackKiroEffort(model({ thinkingLevelMap: { xhigh: "xhigh", max: "max" } }), "claude-opus-4.8")).toEqual({
       field: "output_config",
       values: ["low", "medium", "high", "xhigh", "max"],
+      summarizedThinking: true,
     });
   });
 
@@ -62,6 +65,7 @@ describe("effort fallback derived from thinkingLevelMap", () => {
     expect(fallbackKiroEffort(model({ thinkingLevelMap: { max: "max" } }), "claude-sonnet-4.6")).toEqual({
       field: "output_config",
       values: ["low", "medium", "high", "max"],
+      summarizedThinking: true,
     });
   });
 
@@ -73,10 +77,12 @@ describe("effort fallback derived from thinkingLevelMap", () => {
     expect(fallbackKiroEffort(model({ thinkingLevelMap: undefined }), "openai-gpt-5.6")).toEqual({
       field: "reasoning",
       values: ["low", "medium", "high", "xhigh"],
+      summarizedThinking: false,
     });
     expect(fallbackKiroEffort(model({ thinkingLevelMap: { xhigh: "xhigh" } }), "openai-gpt-5.6")).toEqual({
       field: "reasoning",
       values: ["low", "medium", "high", "xhigh"],
+      summarizedThinking: false,
     });
   });
 
@@ -94,6 +100,7 @@ describe("getKiroEffortConfig", () => {
     expect(getKiroEffortConfig(withSchema, "claude-opus-4.8")).toEqual({
       field: "output_config",
       values: ["low", "high"],
+      summarizedThinking: false,
     });
   });
 
@@ -137,6 +144,28 @@ describe("getKiroEffortConfig", () => {
     expect(fields).toEqual({
       output_config: { effort: "high" },
       thinking: { type: "adaptive", display: "summarized" },
+    });
+  });
+
+  it("omits display when the schema's thinking block does not offer summarized", () => {
+    // Do not send an unsupported enum value; models whose schema lacks
+    // display (or offers only "omitted") must still get adaptive thinking.
+    const schema = {
+      type: "object",
+      properties: {
+        thinking: {
+          type: "object",
+          properties: { type: { type: "string", enum: ["adaptive", "disabled"] } },
+          required: ["type"],
+        },
+        output_config: { type: "object", properties: { effort: { type: "string", enum: ["low", "high"] } } },
+      },
+      additionalProperties: false,
+    };
+    const m = model({ id: "claude-legacy", additionalModelRequestFieldsSchema: schema });
+    expect(buildKiroAdditionalModelRequestFields(m, "claude-legacy", "high")).toEqual({
+      output_config: { effort: "high" },
+      thinking: { type: "adaptive" },
     });
   });
 

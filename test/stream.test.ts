@@ -60,6 +60,20 @@ function effortSchema(field: "reasoning" | "output_config", values: string[]): R
   return {
     type: "object",
     properties: {
+      // Claude's live catalog schema pairs output_config.effort with a thinking
+      // block that offers display: "summarized"; GPT's exposes no thinking.
+      ...(field === "output_config"
+        ? {
+            thinking: {
+              type: "object",
+              properties: {
+                type: { type: "string", enum: ["adaptive", "disabled"] },
+                display: { type: "string", enum: ["summarized", "omitted"] },
+              },
+              required: ["type"],
+            },
+          }
+        : {}),
       [field]: {
         type: "object",
         properties: { effort: { type: "string", enum: values } },
