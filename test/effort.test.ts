@@ -109,7 +109,54 @@ describe("getKiroEffortConfig", () => {
     const m = model({ id: "claude-opus-4-8", thinkingLevelMap: { xhigh: "xhigh", max: "max" } });
     expect(buildKiroAdditionalModelRequestFields(m, "claude-opus-4.8", "max")).toEqual({
       output_config: { effort: "max" },
-      thinking: { type: "adaptive" },
+      thinking: { type: "adaptive", display: "summarized" },
+    });
+  });
+
+  it("requests summarized thinking display so Kiro streams reasoning frames", () => {
+    // Kiro defaults thinking.display to "omitted", which suppresses every
+    // reasoningContentEvent. Verified live against claude-opus-5 and
+    // claude-opus-4.8: 0 reasoning frames without display, >0 with it.
+    const schema = {
+      type: "object",
+      properties: {
+        thinking: {
+          type: "object",
+          properties: {
+            type: { type: "string", enum: ["adaptive", "disabled"] },
+            display: { type: "string", enum: ["summarized", "omitted"] },
+          },
+          required: ["type"],
+        },
+        output_config: { type: "object", properties: { effort: { type: "string", enum: ["low", "high", "max"] } } },
+      },
+      additionalProperties: false,
+    };
+    const m = model({ id: "claude-opus-5", additionalModelRequestFieldsSchema: schema });
+    const fields = buildKiroAdditionalModelRequestFields(m, "claude-opus-5", "high");
+    expect(fields).toEqual({
+      output_config: { effort: "high" },
+      thinking: { type: "adaptive", display: "summarized" },
+    });
+  });
+
+  it("omits the thinking field for GPT models, whose schema has no thinking support", () => {
+    const gptSchema = {
+      type: "object",
+      properties: {
+        reasoning: {
+          type: "object",
+          properties: {
+            mode: { type: "string", enum: ["standard", "pro"], default: "standard" },
+            effort: { type: "string", enum: ["none", "low", "medium", "high", "xhigh", "max"], default: "high" },
+          },
+        },
+      },
+      additionalProperties: false,
+    };
+    const m = model({ id: "gpt-5-6-sol", additionalModelRequestFieldsSchema: gptSchema });
+    expect(buildKiroAdditionalModelRequestFields(m, "gpt-5.6-sol", "medium")).toEqual({
+      reasoning: { effort: "medium" },
     });
   });
 });

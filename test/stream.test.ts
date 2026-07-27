@@ -439,7 +439,7 @@ describe("Feature 9: Streaming Integration", () => {
         additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"]),
       },
       reasoning: "xhigh" as const,
-      expected: { output_config: { effort: "xhigh" }, thinking: { type: "adaptive" } },
+      expected: { output_config: { effort: "xhigh" }, thinking: { type: "adaptive", display: "summarized" } },
     },
     {
       name: "keeps Claude max distinct from xhigh",
@@ -451,7 +451,7 @@ describe("Feature 9: Streaming Integration", () => {
         additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"]),
       },
       reasoning: "max" as const,
-      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive" } },
+      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive", display: "summarized" } },
     },
     {
       name: "uses the known Claude max fallback only when schema is unavailable",
@@ -462,7 +462,7 @@ describe("Feature 9: Streaming Integration", () => {
         thinkingLevelMap: { xhigh: "xhigh", max: "max" },
       },
       reasoning: "max" as const,
-      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive" } },
+      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive", display: "summarized" } },
     },
     {
       name: "clamps the xhigh hole to max before building Claude fields",
@@ -474,7 +474,7 @@ describe("Feature 9: Streaming Integration", () => {
         additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "max"]),
       },
       reasoning: "xhigh" as const,
-      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive" } },
+      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive", display: "summarized" } },
     },
   ])("sends structured effort: $name", async ({ model, reasoning, expected }) => {
     const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');

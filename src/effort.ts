@@ -11,7 +11,7 @@ export interface KiroEffortConfig {
 
 export type KiroAdditionalModelRequestFields =
   | { reasoning: { effort: string } }
-  | { output_config: { effort: string }; thinking: { type: "adaptive" } };
+  | { output_config: { effort: string }; thinking: { type: "adaptive"; display: "summarized" } };
 
 type ModelWithKiroEffortMetadata = Model<Api> & {
   additionalModelRequestFieldsSchema?: unknown;
@@ -132,7 +132,10 @@ export function buildKiroAdditionalModelRequestFields(
   const effort = mapPiLevelToKiroEffort(model, level, config);
   if (!effort) return undefined;
 
+  // `display: "summarized"` is required: Kiro defaults thinking.display to
+  // "omitted", which suppresses every reasoningContentEvent even when adaptive
+  // thinking is enabled. Verified live on claude-opus-5 and claude-opus-4.8.
   return config.field === "output_config"
-    ? { output_config: { effort }, thinking: { type: "adaptive" } }
+    ? { output_config: { effort }, thinking: { type: "adaptive", display: "summarized" } }
     : { reasoning: { effort } };
 }
