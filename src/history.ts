@@ -71,16 +71,26 @@ export function injectSyntheticToolCalls(history: KiroHistoryEntry[]): KiroHisto
   return result;
 }
 
-export function truncateHistory(history: KiroHistoryEntry[], limit: number): KiroHistoryEntry[] {
-  let sanitized = sanitizeHistory(stripHistoryImages(history));
-  let historySize = JSON.stringify(sanitized).length;
-  while (historySize > limit && sanitized.length > 2) {
-    sanitized.shift();
-    while (sanitized.length > 0 && !sanitized[0]?.userInputMessage) sanitized.shift();
-    sanitized = sanitizeHistory(sanitized);
-    historySize = JSON.stringify(sanitized).length;
+/**
+ * Sanitize and normalize outbound history without discarding any entry.
+ *
+ * Silent truncation used to shift the oldest entries off the front until the
+ * payload fit. After Pi compaction that could drop the system/compaction
+ * anchor and split tool-call/tool-result pairs, corrupting context in a way
+ * neither side could detect. Pi owns lossy compaction; we only normalize.
+ */
+export function prepareHistory(history: KiroHistoryEntry[]): KiroHistoryEntry[] {
+  return injectSyntheticToolCalls(sanitizeHistory(stripHistoryImages(history)));
+}
+
+/** Fail before sending rather than silently discarding conversation context. */
+export function assertHistoryWithinLimit(history: KiroHistoryEntry[], limit: number): void {
+  const size = JSON.stringify(history).length;
+  if (size > limit) {
+    throw new Error(
+      `Kiro API error: context_length_exceeded (local history ${size} chars / ${history.length} entries exceeds ${limit}-char limit)`,
+    );
   }
-  return injectSyntheticToolCalls(sanitized);
 }
 
 export function extractToolNamesFromHistory(history: KiroHistoryEntry[]): Set<string> {
