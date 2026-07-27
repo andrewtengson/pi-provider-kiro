@@ -154,4 +154,107 @@ describe("Feature 1: Extension Registration", () => {
       ]),
     );
   });
+
+  describe("refreshModels (host-driven catalog refresh)", () => {
+    const oauthCredential = (region = "us-east-1") => ({
+      type: "oauth" as const,
+      access: "tok",
+      refresh: "r",
+      expires: Date.now() + 60_000,
+      clientId: "",
+      clientSecret: "",
+      region,
+      profileArn: "arn:aws:codewhisperer:us-east-1:123:profile/P",
+    });
+
+    it("is wired so the host can drive a refresh", async () => {
+      const mod = await import("../src/index.js");
+      const { pi, registerProvider } = mockPi();
+      mod.default(pi);
+      expect(typeof registerProvider.mock.calls[0][1].refreshModels).toBe("function");
+    });
+
+    it("fetches the management catalog when the host forces a refresh", async () => {
+      vi.resetModules();
+      const updateKiroModelsCache = vi.fn().mockResolvedValue(undefined);
+      vi.doMock("../src/models.js", async () => {
+        const actual = await vi.importActual<typeof import("../src/models.js")>("../src/models.js");
+        return { ...actual, updateKiroModelsCache, isCacheStale: vi.fn().mockReturnValue(false) };
+      });
+      const mod = await import("../src/index.js");
+      const { pi, registerProvider } = mockPi();
+      mod.default(pi);
+
+      const models = await registerProvider.mock.calls[0][1].refreshModels({
+        credential: oauthCredential(),
+        allowNetwork: true,
+        force: true,
+        store: {} as never,
+      });
+
+      expect(updateKiroModelsCache).toHaveBeenCalledOnce();
+      expect(Array.isArray(models)).toBe(true);
+      vi.doUnmock("../src/models.js");
+    });
+
+    it("never fetches when the host disallows network access", async () => {
+      vi.resetModules();
+      const updateKiroModelsCache = vi.fn().mockResolvedValue(undefined);
+      vi.doMock("../src/models.js", async () => {
+        const actual = await vi.importActual<typeof import("../src/models.js")>("../src/models.js");
+        return { ...actual, updateKiroModelsCache, isCacheStale: vi.fn().mockReturnValue(true) };
+      });
+      const mod = await import("../src/index.js");
+      const { pi, registerProvider } = mockPi();
+      mod.default(pi);
+
+      const models = await registerProvider.mock.calls[0][1].refreshModels({
+        credential: oauthCredential(),
+        allowNetwork: false,
+        store: {} as never,
+      });
+
+      expect(updateKiroModelsCache).not.toHaveBeenCalled();
+      expect(Array.isArray(models)).toBe(true);
+      vi.doUnmock("../src/models.js");
+    });
+
+    it("returns the cached catalog without throwing when the fetch fails", async () => {
+      vi.resetModules();
+      vi.doMock("../src/models.js", async () => {
+        const actual = await vi.importActual<typeof import("../src/models.js")>("../src/models.js");
+        return {
+          ...actual,
+          updateKiroModelsCache: vi.fn().mockRejectedValue(new Error("catalog down")),
+          isCacheStale: vi.fn().mockReturnValue(true),
+        };
+      });
+      const mod = await import("../src/index.js");
+      const { pi, registerProvider } = mockPi();
+      mod.default(pi);
+
+      await expect(
+        registerProvider.mock.calls[0][1].refreshModels({
+          credential: oauthCredential(),
+          allowNetwork: true,
+          force: true,
+          store: {} as never,
+        }),
+      ).resolves.toBeInstanceOf(Array);
+      vi.doUnmock("../src/models.js");
+    });
+
+    it("returns the static baseline when no OAuth credential is configured", async () => {
+      const mod = await import("../src/index.js");
+      const { pi, registerProvider } = mockPi();
+      mod.default(pi);
+
+      const models = await registerProvider.mock.calls[0][1].refreshModels({
+        allowNetwork: true,
+        force: true,
+        store: {} as never,
+      });
+      expect(Array.isArray(models)).toBe(true);
+    });
+  });
 });
