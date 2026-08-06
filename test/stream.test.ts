@@ -2785,4 +2785,62 @@ describe("Feature 9: Streaming Integration", () => {
 
     vi.unstubAllGlobals();
   });
+
+  describe("rawStopReason from metadataEvent", () => {
+    it("preserves END_TURN verbatim on a text-only turn", async () => {
+      const mockFetch = mockFetchOk('{"content":"Hi"}{"stopReason":"END_TURN"}{"contextUsagePercentage":10}');
+      vi.stubGlobal("fetch", mockFetch);
+
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      const done = events.find((e) => e.type === "done");
+
+      expect(done?.type === "done" && done.message.rawStopReason).toBe("END_TURN");
+      expect(done?.type === "done" && done.message.stopReason).toBe("stop");
+
+      vi.unstubAllGlobals();
+    });
+
+    it("keeps stopReason toolUse when Kiro reports END_TURN alongside a tool call", async () => {
+      // gpt-5.6-* reports END_TURN even when it emits real tool calls, so
+      // emittedToolCalls must still win over the raw value.
+      const mockFetch = mockFetchOk(
+        '{"name":"bash","toolUseId":"t1","input":{"cmd":"ls"}}{"stop":true}{"stopReason":"END_TURN"}{"contextUsagePercentage":10}',
+      );
+      vi.stubGlobal("fetch", mockFetch);
+
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      const done = events.find((e) => e.type === "done");
+
+      expect(done?.type === "done" && done.message.rawStopReason).toBe("END_TURN");
+      expect(done?.type === "done" && done.message.stopReason).toBe("toolUse");
+
+      vi.unstubAllGlobals();
+    });
+
+    it("leaves rawStopReason undefined when Kiro sends no metadataEvent", async () => {
+      const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+      vi.stubGlobal("fetch", mockFetch);
+
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      const done = events.find((e) => e.type === "done");
+
+      expect(done?.type === "done" && done.message.rawStopReason).toBeUndefined();
+      expect(done?.type === "done" && done.message.stopReason).toBe("stop");
+
+      vi.unstubAllGlobals();
+    });
+
+    it("does not treat a metadataEvent as assistant text", async () => {
+      const mockFetch = mockFetchOk('{"content":"Hi"}{"stopReason":"END_TURN"}{"contextUsagePercentage":10}');
+      vi.stubGlobal("fetch", mockFetch);
+
+      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      const done = events.find((e) => e.type === "done");
+      const texts = done?.type === "done" ? done.message.content.filter((c) => c.type === "text") : [];
+
+      expect(texts.map((t) => (t as { text: string }).text).join("")).toBe("Hi");
+
+      vi.unstubAllGlobals();
+    });
+  });
 });

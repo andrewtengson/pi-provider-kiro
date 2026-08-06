@@ -551,6 +551,7 @@ export function streamKiro(
         let lastContentData = "";
         let consecutiveWhitespace = 0;
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
+        let rawStopReason: string | undefined;
         let receivedContextUsage = false;
         // Debug-only: ordered trace of raw frame keys and parsed event types to
         // diagnose premature stops (e.g. tool preamble text with no toolUse frame).
@@ -767,6 +768,13 @@ export function streamKiro(
               usageEvent = event.data;
               break;
             }
+            // Kiro's authoritative terminal marker. Recorded for diagnosis only —
+            // it must not drive stopReason, because gpt-5.6-* reports END_TURN
+            // even on turns that emit real tool calls.
+            case "metadata": {
+              rawStopReason = event.data.stopReason;
+              break;
+            }
             case "error": {
               const errMsg = event.data.message ? `${event.data.error}: ${event.data.message}` : event.data.error;
               streamError = errMsg;
@@ -920,9 +928,13 @@ export function streamKiro(
         } else {
           output.stopReason = emittedToolCalls > 0 ? "toolUse" : "stop";
         }
+        if (rawStopReason !== undefined) {
+          output.rawStopReason = rawStopReason;
+        }
         stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
         debugLog("response.done", {
           stopReason: output.stopReason,
+          rawStopReason: rawStopReason ?? null,
           emittedToolCalls,
           sawAnyToolCalls,
           receivedContextUsage,
