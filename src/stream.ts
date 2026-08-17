@@ -758,12 +758,18 @@ export function streamKiro(
           try {
             if (!gotFirstToken) {
               const readPromise = iterator.next();
-              const result = await Promise.race([
-                readPromise,
-                new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) =>
-                  setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), firstTokenTimeoutForModel(model.id)),
-                ),
-              ]);
+              // Clear the timer on every exit path. A leaked first-token timeout
+              // keeps the event loop alive and stalls non-interactive pi runs.
+              let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
+              const timeoutPromise = new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
+                firstTokenTimer = setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), firstTokenTimeoutForModel(model.id));
+              });
+              let result: IteratorResult<Record<string, unknown>> | typeof FIRST_TOKEN_SENTINEL;
+              try {
+                result = await Promise.race([readPromise, timeoutPromise]);
+              } finally {
+                if (firstTokenTimer) clearTimeout(firstTokenTimer);
+              }
               if (result === FIRST_TOKEN_SENTINEL) {
                 readPromise.catch(() => {}); // suppress dangling rejection
                 void bodyReader.cancel().catch(() => {});
