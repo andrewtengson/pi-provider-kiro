@@ -98,5 +98,20 @@ describe("Feature 8: Stream Event Parsing", () => {
       expect(e?.type).toBe("toolUse");
       expect(e?.type === "toolUse" && e.data.input).toBe('{"cmd":"ls"}');
     });
+
+    it("parses metadataEvent stopReason verbatim", () => {
+      const e = parseKiroEvent({ stopReason: "END_TURN" });
+      expect(e?.type).toBe("metadata");
+      expect(e?.type === "metadata" && e.data.stopReason).toBe("END_TURN");
+    });
+
+    it("keeps an unknown stopReason value instead of normalizing it", () => {
+      const e = parseKiroEvent({ stopReason: "SOME_FUTURE_REASON" });
+      expect(e?.type === "metadata" && e.data.stopReason).toBe("SOME_FUTURE_REASON");
+    });
+
+    it("does not let metadata shadow a tool-use stop frame", () => {
+      expect(parseKiroEvent({ stop: true })?.type).toBe("toolUseStop");
+    });
   });
 });

@@ -9,6 +9,7 @@ export type KiroStreamEvent =
   | { type: "toolUseInput"; data: { input: string } }
   | { type: "toolUseStop"; data: { stop: boolean } }
   | { type: "contextUsage"; data: { contextUsagePercentage: number } }
+  | { type: "metadata"; data: { stopReason: string } }
   | { type: "followupPrompt"; data: string }
   | { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
   | { type: "error"; data: { error: string; message?: string } };
@@ -58,6 +59,12 @@ export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent
       type: "usage",
       data: { inputTokens: u.inputTokens as number | undefined, outputTokens: u.outputTokens as number | undefined },
     };
+  }
+  // Kiro's metadataEvent is the only authoritative statement of why the turn
+  // ended (END_TURN / TOOL_USE). It arrives before contextUsageEvent. Keep the
+  // value verbatim so unknown future reasons stay diagnosable.
+  if (typeof parsed.stopReason === "string") {
+    return { type: "metadata", data: { stopReason: parsed.stopReason } };
   }
   return null;
 }

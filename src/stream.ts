@@ -679,6 +679,10 @@ export function streamKiro(
         let lastContentData = "";
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
         let receivedContextUsage = false;
+        let rawStopReason: string | undefined;
+        // Debug-only: ordered trace of raw frame keys and parsed event types, used
+        // to diagnose premature stops (tool preamble text with no toolUse frame).
+        const frameTrace: string[] = [];
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
         let nativeThinkingBlockIndex: number | null = null;
         let nativeThinkingEnded = false;
@@ -794,10 +798,27 @@ export function streamKiro(
           if (done) break;
           resetIdle();
           const eventPayload = Object.values(value as Record<string, unknown>)[0] as Record<string, unknown>;
+          const rawFrameKey = debugEnabled() ? (Object.keys(value as Record<string, unknown>)[0] ?? "?") : "";
           const event = parseKiroEvent(eventPayload);
-          if (!event) continue;
-          if (debugEnabled()) debugLog("stream.events", [event]);
+          if (!event) {
+            if (debugEnabled()) {
+              frameTrace.push(`${rawFrameKey}:UNPARSED`);
+              debugLog("stream.unparsed_frame", { key: rawFrameKey, payloadKeys: Object.keys(eventPayload) });
+            }
+            continue;
+          }
+          if (debugEnabled()) {
+            frameTrace.push(`${rawFrameKey}:${event.type}`);
+            debugLog("stream.events", [event]);
+          }
           switch (event.type) {
+            // Kiro's authoritative terminal marker. Recorded for diagnosis only —
+            // it must not drive stopReason, because gpt-5.6-* reports END_TURN
+            // even on turns that emit real tool calls.
+            case "metadata": {
+              rawStopReason = event.data.stopReason;
+              break;
+            }
             case "contextUsage": {
               const pct = event.data.contextUsagePercentage;
               output.usage.input = Math.round((pct / 100) * model.contextWindow);
@@ -1014,8 +1035,13 @@ export function streamKiro(
         stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
         debugLog("response.done", {
           stopReason: output.stopReason,
+          rawStopReason: rawStopReason ?? null,
           emittedToolCalls,
           sawAnyToolCalls,
+          receivedContextUsage,
+          frameTrace,
+          lastFrame: frameTrace[frameTrace.length - 1] ?? null,
+          textTail: textBlockIndex !== null ? (output.content[textBlockIndex] as TextContent).text.slice(-200) : null,
           textLen: textBlockIndex !== null ? (output.content[textBlockIndex] as TextContent).text.length : 0,
           usage: output.usage,
           content: output.content,
