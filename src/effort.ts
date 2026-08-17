@@ -21,7 +21,7 @@ type ModelWithKiroEffortMetadata = Model<Api> & {
   additionalModelRequestFieldsSchema?: unknown;
 };
 
-const GPT_EFFORT_VALUES = ["low", "medium", "high", "xhigh"] as const;
+const GPT_EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"] as const;
 const CLAUDE_EXTENDED_EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"] as const;
 const CLAUDE_MAX_EFFORT_VALUES = ["low", "medium", "high", "max"] as const;
 const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"] as const;
@@ -70,7 +70,9 @@ export function deriveKiroEffort(schema: unknown): KiroEffortConfig | undefined 
 /** Known-model compatibility used only before catalog schema metadata is available. */
 export function fallbackKiroEffort(kiroModelId: string): KiroEffortConfig | undefined {
   const normalizedId = kiroModelId.toLowerCase().replace(/(\d)-(\d)/g, "$1.$2");
-  if (normalizedId.startsWith("openai-gpt")) {
+  // Kiro reports GPT ids as `gpt-5.6-sol`; the `openai-` prefix only appears in
+  // some catalog surfaces. Match both so a cold cache still sends effort.
+  if (normalizedId.startsWith("openai-gpt") || normalizedId.startsWith("gpt")) {
     return { field: "reasoning", values: GPT_EFFORT_VALUES, summarizedThinking: false };
   }
   if (CLAUDE_EXTENDED_EFFORT_MODELS.has(normalizedId)) {
