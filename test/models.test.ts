@@ -3,8 +3,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { deriveKiroEffort } from "../src/effort.js";
 import type { KiroCatalogModel } from "../src/management.js";
 import {
+  deriveThinkingConfig,
   getCachedModels,
   isCacheStale,
   KIRO_MANAGEMENT_CACHE_PATH,
@@ -22,7 +24,11 @@ const LEGACY_CACHE_PATH = join(homedir(), ".kiro-models-cache.json");
 const TEST_REGION = "test-region-1";
 const PROFILE_ARN = "arn:aws:codewhisperer:test-region-1:123456789012:profile/test";
 
-function effortSchema(field: "reasoning" | "output_config", values: string[]): Record<string, unknown> {
+function effortSchema(
+  field: "reasoning" | "output_config",
+  values: string[],
+  summarizedThinking = false,
+): Record<string, unknown> {
   return {
     type: "object",
     properties: {
@@ -31,6 +37,9 @@ function effortSchema(field: "reasoning" | "output_config", values: string[]): R
         properties: { effort: { type: "string", enum: values } },
         additionalProperties: false,
       },
+      ...(summarizedThinking
+        ? { thinking: { type: "object", properties: { display: { enum: ["summarized", "omitted"] } } } }
+        : {}),
     },
     additionalProperties: false,
   };
@@ -41,13 +50,13 @@ const catalogFixture: KiroCatalogModel[] = [
     modelId: "openai-gpt-5.6",
     displayName: "GPT 5.6",
     tokenLimits: { maxInputTokens: 278_528, maxOutputTokens: 128_000 },
-    additionalModelRequestFieldsSchema: effortSchema("reasoning", ["low", "medium", "high", "xhigh"]),
+    additionalModelRequestFieldsSchema: effortSchema("reasoning", ["none", "low", "medium", "high", "xhigh", "max"]),
   },
   {
     modelId: "claude-opus-4.8",
     displayName: "Catalog Opus 4.8",
     tokenLimits: { maxInputTokens: 900_000, maxOutputTokens: 100_000 },
-    additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"]),
+    additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"], true),
   },
   {
     modelId: "claude-sonnet-4.6",
@@ -116,7 +125,7 @@ describe("Feature 2: Model Definitions", () => {
         id: "openai-gpt-5-6",
         kiroModelId: "openai-gpt-5.6",
         reasoning: true,
-        thinkingLevelMap: { xhigh: "xhigh" },
+        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
         contextWindow: 278_528,
         maxTokens: 128_000,
       },
@@ -161,6 +170,31 @@ describe("Feature 2: Model Definitions", () => {
       expect(opus?.additionalModelRequestFieldsSchema).toEqual(catalogFixture[1].additionalModelRequestFieldsSchema);
       expect(opus?.tokenLimits).toEqual(catalogFixture[1].tokenLimits);
       expect(opus?.contextWindow).not.toBe(kiroModels.find((model) => model.id === opus?.id)?.contextWindow);
+    });
+
+    it("disables text tool-call recovery only for Claude catalog models", () => {
+      const claudeModels = mapped.filter((model) => model.id.startsWith("claude-"));
+      const nonClaudeModels = mapped.filter((model) => !model.id.startsWith("claude-"));
+
+      expect(claudeModels.length).toBeGreaterThan(0);
+      expect(claudeModels.every((model) => model.recoverTextToolCalls === false)).toBe(true);
+      expect(nonClaudeModels.every((model) => model.recoverTextToolCalls === undefined)).toBe(true);
+    });
+
+    it("treats a null schema as absent for auto", () => {
+      const [auto] = mapKiroCatalogModels([{ modelId: "auto", additionalModelRequestFieldsSchema: null }], TEST_REGION);
+
+      expect(auto).toMatchObject({ id: "auto", reasoning: true });
+      expect(auto.additionalModelRequestFieldsSchema).toBeUndefined();
+    });
+
+    it("rejects malformed non-null schemas", () => {
+      expect(() =>
+        mapKiroCatalogModels(
+          [{ modelId: "auto", additionalModelRequestFieldsSchema: "invalid" as never }],
+          TEST_REGION,
+        ),
+      ).toThrow("invalid request-fields schema");
     });
 
     it("preserves the exact service ID for request-time model resolution", () => {
@@ -254,13 +288,22 @@ describe("Feature 2: Model Definitions", () => {
       expect(kiroModels.find((model) => model.id === "minimax-m2-1")?.reasoning).toBe(false);
     });
 
-    it("uses image input for Claude and GPT, and text input for other concrete models", () => {
+    it("uses image input for Claude and GPT, text input for other concrete models", () => {
       const imageModels = kiroModels.filter((model) => model.id.startsWith("claude-") || model.id.startsWith("gpt-"));
       const textOnlyModels = kiroModels.filter(
         (model) => !model.id.startsWith("claude-") && !model.id.startsWith("gpt-") && model.id !== "auto",
       );
       expect(imageModels.every((model) => model.input.includes("text") && model.input.includes("image"))).toBe(true);
       expect(textOnlyModels.every((model) => model.input.length === 1 && model.input[0] === "text")).toBe(true);
+    });
+
+    it("disables text tool-call recovery only for Claude bootstrap models", () => {
+      const claudeModels = kiroModels.filter((model) => model.id.startsWith("claude-"));
+      const nonClaudeModels = kiroModels.filter((model) => !model.id.startsWith("claude-"));
+
+      expect(claudeModels.length).toBeGreaterThan(0);
+      expect(claudeModels.every((model) => model.recoverTextToolCalls === false)).toBe(true);
+      expect(nonClaudeModels.every((model) => model.recoverTextToolCalls === undefined)).toBe(true);
     });
   });
 
@@ -279,13 +322,13 @@ describe("Feature 2: Model Definitions", () => {
     ];
     const MAX_WITHOUT_XHIGH_MODELS = ["claude-opus-4-6", "claude-sonnet-4-6"];
 
-    it("advertises xhigh and max only when both are mapped", () => {
+    it("advertises xhigh and max independently when both are supported", () => {
       for (const model of kiroModels.filter((candidate) => XHIGH_AND_MAX_MODELS.includes(candidate.id))) {
         expect(getSupportedThinkingLevels(model), `${model.id} supported levels`).toEqual(THROUGH_XHIGH_AND_MAX);
       }
     });
 
-    it("supports the max-without-xhigh hole", () => {
+    it("preserves a max-without-xhigh capability hole", () => {
       for (const model of kiroModels.filter((candidate) => MAX_WITHOUT_XHIGH_MODELS.includes(candidate.id))) {
         expect(getSupportedThinkingLevels(model), `${model.id} supported levels`).toEqual(THROUGH_HIGH_AND_MAX);
       }
@@ -306,6 +349,115 @@ describe("Feature 2: Model Definitions", () => {
       for (const model of kiroModels.filter((candidate) => !candidate.reasoning)) {
         expect(getSupportedThinkingLevels(model), `${model.id} supported levels`).toEqual(["off"]);
       }
+    });
+  });
+
+  describe("omp thinking config", () => {
+    const OPUS_SCHEMA = effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"], true);
+
+    function validCache(models: unknown[], version: number = KIRO_MANAGEMENT_CACHE_VERSION): string {
+      return JSON.stringify({
+        version,
+        source: KIRO_MANAGEMENT_CACHE_SOURCE,
+        regions: { [TEST_REGION]: { region: TEST_REGION, fetchedAt: Date.now(), models } },
+      });
+    }
+
+    it("returns the full ladder and display capability from a catalog schema", () => {
+      expect(deriveThinkingConfig(deriveKiroEffort(OPUS_SCHEMA))).toEqual({
+        mode: "effort",
+        efforts: ["low", "medium", "high", "xhigh", "max"],
+        supportsDisplay: true,
+      });
+    });
+
+    it("returns undefined when no supported effort enum is present", () => {
+      expect(deriveThinkingConfig(deriveKiroEffort({ type: "object", properties: {} }))).toBeUndefined();
+      expect(deriveThinkingConfig({ field: "reasoning", values: [], summarizedThinking: false })).toBeUndefined();
+    });
+
+    it("filters values outside omp's effort enum", () => {
+      expect(
+        deriveThinkingConfig({
+          field: "reasoning",
+          values: ["none", "low", "turbo", "max"],
+          summarizedThinking: false,
+        }),
+      ).toEqual({
+        mode: "effort",
+        efforts: ["low", "max"],
+      });
+    });
+
+    it("orders efforts lowest-first regardless of schema order", () => {
+      expect(
+        deriveThinkingConfig({
+          field: "reasoning",
+          values: ["max", "low", "high"],
+          summarizedThinking: false,
+        })?.efforts,
+      ).toEqual(["low", "high", "max"]);
+    });
+
+    it("emits both thinking and thinkingLevelMap for a schema-bearing catalog model", () => {
+      const opus = mapKiroCatalogModels(catalogFixture, TEST_REGION).find((model) => model.id === "claude-opus-4-8");
+
+      expect(opus?.thinking).toEqual({
+        mode: "effort",
+        efforts: ["low", "medium", "high", "xhigh", "max"],
+        supportsDisplay: true,
+      });
+      expect(opus?.thinkingLevelMap).toEqual({ xhigh: "xhigh", max: "max" });
+    });
+
+    it("declares a ladder for every bootstrap model that maps xhigh or max", () => {
+      const laddered = kiroModels.filter((model) => model.thinkingLevelMap !== undefined);
+
+      expect(laddered.length).toBeGreaterThan(0);
+      expect(laddered.every((model) => (model.thinking?.efforts.length ?? 0) > 0)).toBe(true);
+      expect(kiroModels.every((model) => model.reasoning || model.thinking === undefined)).toBe(true);
+    });
+
+    it("uses the request fallback only when catalog schema is absent", () => {
+      const [schemaLess] = mapKiroCatalogModels([{ modelId: "claude-opus-4.8" }], TEST_REGION);
+      const [schemaWithoutEffort] = mapKiroCatalogModels(
+        [{ modelId: "claude-opus-4.8", additionalModelRequestFieldsSchema: { type: "object", properties: {} } }],
+        TEST_REGION,
+      );
+
+      expect(schemaLess.thinking?.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+      expect(schemaWithoutEffort.thinking).toBeUndefined();
+    });
+
+    it("keeps a cached entry that carries a thinking config", () => {
+      const models = mapKiroCatalogModels(catalogFixture, TEST_REGION);
+      expect(models.some((model) => model.thinking !== undefined)).toBe(true);
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, validCache(models), "utf-8");
+
+      expect(getCachedModels(TEST_REGION).map((model) => model.id)).toEqual(models.map((model) => model.id));
+    });
+
+    it.each([
+      ["a non-effort mode", { mode: "budget", efforts: ["low"] }],
+      ["an empty effort list", { mode: "effort", efforts: [] }],
+      ["an effort outside the enum", { mode: "effort", efforts: ["turbo"] }],
+      ["a non-array effort list", { mode: "effort", efforts: "low" }],
+      ["a non-boolean display flag", { mode: "effort", efforts: ["low"], supportsDisplay: "yes" }],
+    ])("discards the whole cache when an entry has %s", (_label, thinking) => {
+      const [first, ...rest] = mapKiroCatalogModels(catalogFixture, TEST_REGION);
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, validCache([{ ...first, thinking }, ...rest]), "utf-8");
+
+      expect(getCachedModels(TEST_REGION)).toBe(kiroModels);
+    });
+
+    it("drops a v1 cache written before the thinking field existed", () => {
+      const models = mapKiroCatalogModels(catalogFixture, TEST_REGION).map(
+        ({ thinking: _thinking, ...model }) => model,
+      );
+      writeFileSync(KIRO_MANAGEMENT_CACHE_PATH, validCache(models, 1), "utf-8");
+
+      expect(getCachedModels(TEST_REGION)).toBe(kiroModels);
+      expect(isCacheStale(TEST_REGION)).toBe(true);
     });
   });
 });

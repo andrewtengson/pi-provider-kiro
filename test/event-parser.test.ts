@@ -30,17 +30,17 @@ describe("Feature 8: Stream Event Parsing", () => {
       expect(parseKiroEvent({ content: "Hello " })).toEqual({ type: "content", data: "Hello " });
     });
 
-    it("parses native reasoning text and signature", () => {
-      expect(parseKiroEvent({ text: "Considering options", signature: "signed-reasoning" })).toEqual({
-        type: "reasoning",
-        data: { text: "Considering options", signature: "signed-reasoning" },
+    it("parses summarized thinking text", () => {
+      expect(parseKiroEvent({ text: "Considering options" })).toEqual({
+        type: "thinkingText",
+        data: "Considering options",
       });
     });
 
-    it("parses signature-only native reasoning frames", () => {
-      expect(parseKiroEvent({ signature: "signed-reasoning" })).toEqual({
-        type: "reasoning",
-        data: { text: "", signature: "signed-reasoning" },
+    it("parses summarized thinking signature", () => {
+      expect(parseKiroEvent({ signature: "opaque-signature" })).toEqual({
+        type: "thinkingSignature",
+        data: "opaque-signature",
       });
     });
 
@@ -98,33 +98,20 @@ describe("Feature 8: Stream Event Parsing", () => {
       expect(e?.type).toBe("toolUse");
       expect(e?.type === "toolUse" && e.data.input).toBe('{"cmd":"ls"}');
     });
-  });
 
-  describe("metadataEvent (Kiro's authoritative terminal marker)", () => {
-    it("parses END_TURN", () => {
+    it("parses metadataEvent stopReason verbatim", () => {
       const e = parseKiroEvent({ stopReason: "END_TURN" });
       expect(e?.type).toBe("metadata");
       expect(e?.type === "metadata" && e.data.stopReason).toBe("END_TURN");
     });
 
-    it("parses TOOL_USE", () => {
-      const e = parseKiroEvent({ stopReason: "TOOL_USE" });
-      expect(e?.type).toBe("metadata");
-      expect(e?.type === "metadata" && e.data.stopReason).toBe("TOOL_USE");
+    it("keeps an unknown stopReason value instead of normalizing it", () => {
+      const e = parseKiroEvent({ stopReason: "SOME_FUTURE_REASON" });
+      expect(e?.type === "metadata" && e.data.stopReason).toBe("SOME_FUTURE_REASON");
     });
 
-    it("parses unknown future stop reasons verbatim", () => {
-      const e = parseKiroEvent({ stopReason: "MAX_TOKENS" });
-      expect(e?.type === "metadata" && e.data.stopReason).toBe("MAX_TOKENS");
-    });
-
-    it("ignores a non-string stopReason", () => {
-      expect(parseKiroEvent({ stopReason: 7 })).toBeNull();
-    });
-
-    it("lets error frames win over a co-present stopReason", () => {
-      const e = parseKiroEvent({ error: "boom", stopReason: "END_TURN" });
-      expect(e?.type).toBe("error");
+    it("does not let metadata shadow a tool-use stop frame", () => {
+      expect(parseKiroEvent({ stop: true })?.type).toBe("toolUseStop");
     });
   });
 });

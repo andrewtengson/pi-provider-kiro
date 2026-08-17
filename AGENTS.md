@@ -1,291 +1,103 @@
 # AGENTS.md — pi-provider-kiro
 
-Guidance for coding agents working on this provider fork.
+> Context file for AI coding assistants working on this codebase.
 
-## Purpose
+## Project Overview
 
-This pi extension connects `@earendil-works/pi-coding-agent` to the Kiro API (AWS CodeWhisperer/Q). It owns:
+pi extension that connects the pi coding agent to the Kiro API (AWS CodeWhisperer/Q). Provides 17 models across 7 families with multi-provider authentication (AWS Builder ID, Google, GitHub).
 
-- Builder ID, IAM Identity Center, Google, and GitHub authentication
-- credential reuse and refresh through `kiro-cli`
-- Kiro API region resolution and management/runtime endpoint construction
-- authenticated management-API model discovery, metadata enrichment, and versioned regional caching
-- pi-to-Kiro request and history conversion
-- native and XML-fallback reasoning handling
-- streamed text, tool calls, usage, retries, and safety guards
+## Directory Structure
 
-The maintained package source is this repository. Do not patch installed `dist/` files or recreate provider behavior in dotfiles extensions.
+```
+pi-provider-kiro/
+├── src/                    # TypeScript source (9 files, one feature each)
+│   ├── index.ts            # F1: Extension registration entry point
+│   ├── models.ts           # F2: Model catalog + ID resolution
+│   ├── oauth.ts            # F3: Multi-provider OAuth (Builder ID / Google / GitHub)
+│   ├── kiro-cli.ts         # F4: kiro-cli SQLite credential sharing
+│   ├── transform.ts        # F5: pi ↔ Kiro message transformation
+│   ├── history.ts          # F6: History truncation + sanitization
+│   ├── thinking-parser.ts  # F7: Streaming <thinking> tag parser
+│   ├── event-parser.ts     # F8: Kiro stream JSON event parser
+│   ├── stream.ts           # F9: Main streaming orchestrator
+│   ├── login.ts            # F10: Interactive login (Builder ID / IdC / social)
+│   └── history-validator.ts # F11: Conversation invariant validation + repair
+├── test/                   # 1:1 test files for each source file
+├── dist/                   # Compiled output (tsc)
+├── .agents/summary/        # Detailed documentation (architecture, components, etc.)
+├── package.json            # Extension config: pi.extensions → dist/index.js
+├── tsconfig.json           # ES2022, ESNext modules, strict
+└── vitest.config.ts        # Test config
+```
 
-## Runtime Installation
+## Key Patterns
 
-Pi tracks the fork's mutable `main` branch:
+### Feature-per-file
+Each `src/` file owns exactly one numbered feature (F1–F11). When modifying a feature, the relevant file is obvious. Each has a matching test file. The numbered set is not the whole tree — `src/` also holds unnumbered support modules (`endpoints.ts`, `retry.ts`, `debug.ts`, and others).
+
+### Model ID Convention
+pi uses dashes (`claude-sonnet-4-6`), Kiro API uses dots (`claude-sonnet-4.6`). Conversion in `resolveKiroModel()` via regex: `(\d)-(\d)` → `$1.$2`. The `KIRO_MODEL_IDS` Set is the source of truth for valid model IDs.
+
+### Kiro History Format
+Kiro requires strict alternating `userInputMessage` / `assistantResponseMessage` entries. Tool results must be wrapped in synthetic user messages. `buildHistory()` in transform.ts handles this; `history.ts` sanitizes and truncates.
+
+A tool-result turn carries its payload in `userInputMessageContext.toolResults` and ships `content: ""`. Kiro's rule is content **or** tool results (`NON_EMPTY_USER_MESSAGE` in first-party Kiro Agent), so no carrier text is needed — and inventing some puts a sentence the user never wrote into the conversation as a user utterance. `EMPTY_CONTENT_PLACEHOLDER` is only for a turn with neither: image-only, empty-text, or an out-of-union role.
+
+`history-validator.ts` (F11) owns the seven invariants. `streamKiro` calls `repairKiroConversation` on the whole conversation (history plus the current message) immediately before building the request and sends the repaired entries. It never throws; a violation that survives repair is warned about, not fatal. `prepareHistory` still runs first and still owns image stripping, truncation, and its own salvage passes — but its pairing test is positional, so a mismatched tool-use/tool-result pair reaches repair as the shape that actually needs fixing.
+
+A tool result that arrived behind a later assistant turn than the one that called it is relocated back behind its issuing turn, matched by id, before anything positional runs (`relocateDisplacedToolResults`). That preserves the real tool output which positional sanitization would otherwise discard, and for the interleaved-transcript shape it also makes `ALTERNATING_MESSAGES` hold — the interjection merges into the relocated carrier instead of forming a second consecutive user entry. The cost is wire chronology: a user turn that interrupted between a call and its result now appears after that result. Pinned by tests in `test/stream.test.ts` and `test/transform.test.ts`; see the CHANGELOG entry.
+
+Historical assistant reasoning is **not** serialized into `assistantResponseMessage.content`. First-party Kiro Agent's `extractTextContent` type-filters to `text`, and flattening reasoning to `<thinking>…</thinking>` fabricated an XML dialect into the model's own remembered speech. A reasoning-only assistant turn is retained with `content: ""` so alternation survives.
+
+### Streaming Pipeline
+Raw bytes → `parseKiroEvents()` → typed `KiroStreamEvent` → `ThinkingTagParser` (if reasoning) → pi `AssistantMessageEventStream` events.
+
+### Retry with Reduction
+On 413/too-large: error propagated immediately to the caller (no retry). The caller is responsible for handling context overflow (e.g., compaction or history trimming), matching kiro-cli behavior.
+
+### Credential Cascade
+1. kiro-cli SQLite DB — checks social token first (`kirocli:social:token`), then IDC token
+2. OAuth device code flow (interactive, opens browser)
+
+### Auth Methods
+- `idc`: AWS Builder ID or IAM Identity Center (SSO). Refresh via SSO OIDC endpoint. Token format: `refreshToken|clientId|clientSecret|idc`. Preferred — has clientId/clientSecret for refresh.
+- `desktop`: Google/GitHub social login via Kiro auth service. Refresh via `prod.{region}.auth.desktop.kiro.dev`. Token format: `refreshToken|desktop`
+
+### Login Methods
+Users can authenticate via:
+- **Builder ID**: Native device code flow (works in SSH/remote)
+- **Google**: Social login (delegates to `kiro-cli login`, requires local browser or SSH port forwarding)
+- **GitHub**: Social login (delegates to `kiro-cli login`, requires local browser or SSH port forwarding)
+
+## Development
 
 ```bash
-pi package install 'git:github.com/andrewtengson/pi-provider-kiro@main'
+npm run build     # tsc → dist/
+npm run check     # tsc --noEmit (type check only)
+npm test          # vitest run (248 tests)
+npm run test:watch # vitest (watch mode)
 ```
 
-Run the command again after publishing changes, then restart pi. The installed checkout is normally under:
-
-```text
-~/.pi/agent/git/github.com/andrewtengson/pi-provider-kiro
-```
-
-### Local testing
-
-To test uncommitted changes, point a local path at this repository in
-`~/.pi/agent/settings.json` `packages` instead of the git ref, then restart pi:
-
-```json
-"/absolute/path/to/pi-provider-kiro"
-```
-
-Register only one Kiro entry at a time (git ref or local path, not both). Pi loads
-the built `dist/index.js` via the `pi.extensions` manifest, so run `npm run build`
-after each source edit and restart pi. A bare `pi --list-models kiro` does not
-authenticate, refresh, or stream, so it will not regenerate the management cache;
-it shows the bootstrap catalog until a real session runs discovery.
-
-## Source Map
-
-```text
-src/
-├── index.ts              Provider registration and region-aware model projection
-├── endpoints.ts          API region map and management/runtime host construction
-├── management.ts         Authenticated control plane: profiles, model catalog, usage limits
-├── models.ts             Bootstrap catalog, management-catalog mapping, versioned regional cache
-├── effort.ts             Schema-derived reasoning effort with thinking-level fallback
-├── oauth.ts              Login and token refresh orchestration
-├── kiro-cli.ts           CLI SQLite credentials and CLI token refresh
-├── kiro-ide.ts           Kiro IDE credential integration
-├── login.ts              Device and social login flows
-├── login-ui.ts           Interactive login UI integration
-├── transform.ts          Request conversion and signed reasoning replay
-├── history.ts            History normalization and sanitization
-├── event-parser.ts       Native Kiro stream-event parsing
-├── thinking-parser.ts    XML `<thinking>` fallback parser
-├── bracket-tool-parser.ts Bracket-style tool-call fallback parser
-├── stream.ts             Request execution, streaming, retries, tool calls
-├── retry.ts              Retry classification
-├── truncation.ts         Context truncation helpers
-├── tokenizer.ts          Token estimation
-├── usage.ts              Kiro usage lookup via management GetUsageLimits
-└── debug.ts              Structured debug logging and secret redaction
-
-test/                     Vitest behavior tests (isolated HOME via test/setup.ts)
-```
-
-`dist/index.js` is generated by `npm run build`. Never edit it directly.
-
-## Endpoints
-
-`src/endpoints.ts` owns API region resolution and host construction. kiro-cli
-talks only to the current Kiro services, and so does this provider:
-
-- management control plane: `https://management.<region>.kiro.dev/`
-  (`ListAvailableProfiles`, `ListAvailableModels`, `Get-Usage-Limits`)
-- runtime inference: `https://runtime.<region>.kiro.dev/`
-  (`GenerateAssistantResponse`)
-
-`resolveApiRegion()` maps an SSO/OIDC region to the API region (for example
-`eu-west-1` → `eu-central-1`). The legacy `q.<region>.amazonaws.com` surface is
-no longer used. Unsupported regions fail loudly rather than silently degrading;
-verify a region resolves on the new hosts before relying on it.
-
-## Model Catalog and Discovery
-
-`src/models.ts` owns the bootstrap catalog and the versioned regional cache at
-`~/.kiro-management-models-cache.json` (cache `version: 1`, `source:
-"kiro-management"`, 1-hour TTL). `src/management.ts` performs the authenticated
-catalog fetch.
-
-Discovery is authenticated and dynamic; there is no `kiro-cli` invocation and no
-startup discovery seam. `updateKiroModelsCache()` runs from three places (all
-skipped under `VITEST`):
-
-1. after login (`loginKiro`),
-2. after token refresh (`refreshKiroToken`),
-3. before a streaming request when `isCacheStale(region)` is true.
-
-Each run resolves a profile ARN, calls management `ListAvailableModels`
-(`origin: KIRO_CLI`), maps the catalog with `mapKiroCatalogModels`, and writes the
-region entry atomically (temp file + rename). On failure it throws and the last
-valid cache is preserved. `getCachedModels(region)` returns the region's cached
-models, or the bootstrap list when no cache exists yet. `modifyModels` reads the
-mapped-region cache, preserves other providers' models, and attaches `kiroRegion`
-and the credential `kiroProfileArn` to the in-memory Kiro model projection.
-
-`mapKiroCatalogModels` derives per model:
-
-- `reasoning` and `thinkingLevelMap` from the effort schema
-  (`additionalModelRequestFieldsSchema`), falling back to family markers when a
-  catalog entry has no schema,
-- context/output limits from catalog `tokenLimits`,
-- `input` modalities and `firstTokenTimeout` from a matching bootstrap entry when
-  present (this is why image-capable models must exist in the bootstrap list).
-
-ID convention:
-
-- Kiro: `gpt-5.6-sol`, `claude-opus-4.8`
-- pi: `gpt-5-6-sol`, `claude-opus-4-8`
-- Conversion only replaces digit-dot-digit or digit-dash-digit version separators.
-- `resolveKiroModel(modelId, exactKiroModelId?)` prefers the exact catalog ID from
-  the model projection, then the cache, then the bootstrap list.
-
-Do not rely on fixed model-count assertions for discovery. The discovered cache
-can contain more models than the bootstrap list. Test catalog behavior and exact
-required metadata instead.
-
-Bootstrap catalog rules:
-
-- The bootstrap list (`kiroModels`) is the pre-authentication / cold-cache set and
-  must include every model users depend on, so models survive cache deletion and
-  keep their `input`/`firstTokenTimeout` metadata through discovery.
-- Prefer catalog metadata; use conservative bootstrap values only where the
-  catalog is silent.
-- There is no `DISCOVERED_MODEL_METADATA` table and no `MODELS_BY_REGION`
-  allowlist; both were removed with the endpoint migration.
-
-Current critical metadata:
-
-- GPT-5.6 Sol/Terra/Luna: 272K context, 128K output, reasoning, text and image
-  input. These are bootstrap models so they appear on a cold cache and keep image
-  input after discovery.
-- Keep Kiro-reported context windows; do not substitute upstream vendor context
-  limits.
-
-## Reasoning
-
-Reasoning effort is schema-driven in `src/effort.ts`. `getKiroEffortConfig` reads
-the model's catalog `additionalModelRequestFieldsSchema` to learn the effort
-field and allowed enum, then `buildKiroAdditionalModelRequestFields` produces the
-top-level Kiro field:
-
-- Claude: `additionalModelRequestFields.output_config.effort` plus
-  `thinking: { type: "adaptive" }`
-- GPT: `additionalModelRequestFields.reasoning.effort`
-
-When a model has no catalog schema, `fallbackKiroEffort` derives the values from
-the model's own `thinkingLevelMap` (xhigh/max) and the family (GPT →
-`reasoning`, Claude → `output_config`). Never replace a present catalog schema
-with a family guess. Prompt-injected `<thinking_mode>`/`<max_thinking_length>`
-is used only when a reasoning model has no effort config; the `max` level maps to
-a 70000 budget.
-
-Native `reasoningContentEvent` frames become pi thinking events. Preserve Kiro
-reasoning signatures in assistant content and replay them through
-`src/transform.ts`; signed replay is required for native multi-turn reasoning
-continuity.
-
-`ThinkingTagParser` handles XML `<thinking>` only as a fallback. Do not replace
-native reasoning with prompt-generated XML.
-
-Kiro accepts GPT-5.6 effort settings but may omit native reasoning frames. The
-provider cannot synthesize a live thinking event when upstream sends none. Pi's
-`hideThinkingBlock` controls rendering, not event production.
-
-## History and Tool Calls
-
-Kiro requires alternating user and assistant history entries. `buildHistory()` in `src/transform.ts` converts pi messages and wraps tool results in user messages. Keep tool-call IDs and reasoning signatures stable across replay.
-
-Tool calls returned by direct provider replay must remain inert. Do not feed replay output into pi's agent loop unless tool execution is explicitly intended.
-
-## Streaming and Recovery
-
-`src/stream.ts` handles Kiro-specific recovery:
-
-- credential refresh for `403` authentication races
-- management-based profile ARN resolution, with re-resolution and desktop-profile
-  inheritance across a `403` credential rotation
-- first-token timeout and stalled-stream retries
-- empty-response and echo-loop retries
-- bounded retries for `INSUFFICIENT_MODEL_CAPACITY`
-- immediate failure for hard quotas such as `MONTHLY_REQUEST_COUNT`
-- one retry for text-only responses with no context usage and no tool calls
-- abortion after more than 4,096 consecutive whitespace characters
-
-The region and runtime endpoint come from the model projection (`kiroRegion`,
-falling back to the region parsed from `baseUrl`). `profileArn` is a required
-field in the runtime request body; error bodies and status text are redacted
-before logging.
-
-Generic HTTP `429` and `5xx` retries belong to pi's session layer.
-
-Do not infer unfinished work from prose or semantic regular expressions. A normal text-only `stop` has no reliable Kiro final-versus-progress signal. Retrying every such response would also retry genuine final answers.
-
-The truncation retry is intentionally narrow: text exists, no context usage arrived, and no tool call was observed. A second truncation remains a `length` stop rather than looping.
-
-Clear timeout handles on every successful or failed stream path. Leaked first-token timers keep non-interactive pi processes alive.
-
-## Authentication
-
-Credential preference in `getKiroCliCredentials()`:
-
-1. IAM Identity Center / OIDC token from the `kiro-cli` SQLite database
-2. desktop social token
-3. interactive login when reusable credentials are unavailable
-
-Supported interactive methods:
-
-- Builder ID device code
-- IAM Identity Center start URL
-- Google through `kiro-cli`
-- GitHub through `kiro-cli`
-
-The provider uses Node's built-in SQLite API when available and falls back to the `sqlite3` CLI. Do not assume only one backend.
-
-Profile ARN resolution goes through `src/management.ts`
-(`resolveKiroProfileArn`), which caches per token+region with in-flight dedup.
-A credential-provided `profileArn` (social/desktop tokens) is used directly; when
-absent, the provider resolves one via management `ListAvailableProfiles`.
-
-## Usage
-
-`src/usage.ts` reads account usage via management `Get-Usage-Limits`
-(`origin: KIRO_CLI`, `resourceType: CREDIT`). It first attempts profile-less, and
-retries once with a resolved profile ARN on `403` or on `400 "Invalid
-profileArn."` (accounts that require a profile reject profile-less usage with
-`400`, confirmed by live smoke). Other statuses surface without retry.
-
-## Development Workflow
-
-Use test-driven development for behavior changes:
-
-1. Add one behavior test at a public seam.
-2. Run it and confirm the expected failure.
-3. Implement the smallest passing change.
-4. Run the targeted test.
-5. Run full validation before publishing.
-
-Required validation:
-
-```bash
-npm run format
-npm test
-npm run check
-npm run build
-npm run lint
-```
-
-`npm run check` type-checks both `src` and the test suite
-(`tsconfig.test.json`). `npm run lint` should report no errors and no warnings.
-
-Use inert direct-provider replay for long-history regressions. Never let replay tests execute returned tool calls.
-
-## Code Standards
-
-- TypeScript strict mode; avoid `any` except documented external type gaps.
-- Handle errors explicitly at public boundaries. Fail-open cache discovery must preserve working cached/built-in behavior.
-- Keep provider modules self-contained with small public interfaces.
-- Use standard library APIs before adding dependencies.
-- Do not log tokens, refresh secrets, authorization headers, or full credential records.
-- Do not edit generated output, installed package clones, or dotfiles to implement provider behavior.
-
-## Release Checklist
-
-1. Full validation passes.
-2. Commit source, tests, and documentation together when they describe one behavior.
-3. Push the validated commit to `main`.
-4. Reinstall `git:github.com/andrewtengson/pi-provider-kiro@main`.
-5. Confirm installed `HEAD` matches `main`.
-6. Run `pi --list-models kiro` and verify critical metadata.
-7. For stream changes, run a live or inert replay smoke test as appropriate.
+## Testing Patterns
+
+- All tests use Vitest
+- External calls (`fetch`, `execSync`, `existsSync`) are mocked via `vi.fn()` / `vi.stubGlobal()`
+- Stream tests mock `fetch` to return a `ReadableStream`-like reader with `read()` returning encoded JSON chunks
+- No integration tests — all unit tests with mocks
+- Test file naming: `test/<source-name>.test.ts`
+
+## Adding a New Model
+
+1. Add the Kiro model ID to `KIRO_MODEL_IDS` Set in `src/models.ts`
+2. Add a model definition object to the `kiroModels` array with: id (dash format), name, reasoning, input modalities, contextWindow, maxTokens
+3. Update test counts in `test/models.test.ts` and `test/registration.test.ts`
+4. Run `npm test` to verify
+
+## Common Gotchas
+
+- `ZERO_COST` is a frozen shared object — don't try to mutate model costs
+- The `as any` cast in `index.ts` is intentional — `ProviderConfig.oauth` doesn't type `getCliCredentials`
+- `kiro-cli.ts` uses `sqlite3` CLI via `execSync`, not a Node native module
+- Output token count is estimated (`content.length / 4`), not from the API
+- `contextUsagePercentage` is the only usage metric Kiro provides; input tokens are back-calculated
+- Social login (Google/GitHub) requires `kiro-cli` to be installed — pi delegates the auth flow to it

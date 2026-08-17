@@ -2,24 +2,22 @@
 // ABOUTME: Binary framing is handled by @smithy/core EventStreamMarshaller in stream.ts.
 
 export type KiroStreamEvent =
-  | { type: "reasoning"; data: { text: string; signature?: string } }
   | { type: "content"; data: string }
+  | { type: "thinkingText"; data: string }
+  | { type: "thinkingSignature"; data: string }
   | { type: "toolUse"; data: { name: string; toolUseId: string; input: string; stop?: boolean } }
   | { type: "toolUseInput"; data: { input: string } }
   | { type: "toolUseStop"; data: { stop: boolean } }
   | { type: "contextUsage"; data: { contextUsagePercentage: number } }
+  | { type: "metadata"; data: { stopReason: string } }
   | { type: "followupPrompt"; data: string }
   | { type: "usage"; data: { inputTokens?: number; outputTokens?: number } }
-  | { type: "metadata"; data: { stopReason: string } }
   | { type: "error"; data: { error: string; message?: string } };
 
 export function parseKiroEvent(parsed: Record<string, unknown>): KiroStreamEvent | null {
-  const reasoningText = typeof parsed.text === "string" ? parsed.text : "";
-  const reasoningSignature = typeof parsed.signature === "string" ? parsed.signature : undefined;
-  if (reasoningText || reasoningSignature) {
-    return { type: "reasoning", data: { text: reasoningText, signature: reasoningSignature } };
-  }
   if (parsed.content !== undefined) return { type: "content", data: parsed.content as string };
+  if (typeof parsed.text === "string") return { type: "thinkingText", data: parsed.text };
+  if (typeof parsed.signature === "string") return { type: "thinkingSignature", data: parsed.signature };
   if (parsed.name && parsed.toolUseId) {
     const input =
       typeof parsed.input === "string"

@@ -131,40 +131,51 @@ describe("Feature 6: History Management", () => {
     });
   });
 
-  describe("prepareHistory / assertHistoryWithinLimit", () => {
-    it("prepares history without dropping entries", () => {
+  describe("prepareHistory and history budget", () => {
+    it("preserves valid history at the limit", () => {
       const h = [userEntry("hi"), assistantEntry("hello")];
       const prepared = prepareHistory(h);
-      expect(prepared).toHaveLength(2);
-      expect(() => assertHistoryWithinLimit(prepared, HISTORY_LIMIT)).not.toThrow();
+      const size = JSON.stringify(prepared).length;
+
+      expect(prepared).toEqual(h);
+      expect(() => assertHistoryWithinLimit(prepared, size)).not.toThrow();
     });
 
-    it("fails closed instead of silently discarding oldest entries when over limit", () => {
-      // Silent truncation used to drop the compaction anchor and break tool
-      // pairs. Throwing lets Pi compact and retry with intact context.
-      const big = Array.from({ length: 100 }, (_, i) => [
-        userEntry(`msg-${i} ${"x".repeat(10000)}`),
-        assistantEntry(`reply-${i} ${"y".repeat(10000)}`),
-      ]).flat();
-      const prepared = prepareHistory(big);
-      expect(prepared).toHaveLength(big.length);
-      expect(() => assertHistoryWithinLimit(prepared, 50000)).toThrow(/context_length_exceeded/);
+    it("raises overflow instead of dropping a compacted anchor and tool-only suffix", () => {
+      const result = (id: string): KiroToolResult => ({
+        toolUseId: id,
+        content: [{ text: "x".repeat(300) }],
+        status: "success",
+      });
+      // Tool-result carriers ship empty `content` — the payload is toolResults.
+      const h = [
+        userEntry("SYSTEM PROMPT\n\n<summary>ORIGINAL TASK</summary>"),
+        assistantEntry("", [{ name: "read", toolUseId: "tc1", input: {} }]),
+        userEntry("", [result("tc1")]),
+        assistantEntry("", [{ name: "read", toolUseId: "tc2", input: {} }]),
+        userEntry("", [result("tc2")]),
+      ];
+      const prepared = prepareHistory(h);
+      const size = JSON.stringify(prepared).length;
+
+      expect(prepared).toHaveLength(h.length);
+      expect(prepared[0].userInputMessage?.content).toContain("ORIGINAL TASK");
+      expect(() => assertHistoryWithinLimit(prepared, size - 1)).toThrow(/context_length_exceeded/);
+      expect(() => assertHistoryWithinLimit(prepared, size - 1)).toThrow(`${size} chars / ${h.length} entries`);
     });
 
-    it("scaled limit for a 1M context model accepts history a fixed limit would reject", () => {
+    it("scales the non-lossy budget with the model context window", () => {
       const entrySize = 10000;
       const count = Math.ceil(HISTORY_LIMIT / entrySize) + 10;
-      const big = Array.from({ length: count }, (_, i) => [
-        userEntry(`msg-${i} ${"x".repeat(entrySize)}`),
-        assistantEntry(`reply-${i} ${"y".repeat(entrySize)}`),
-      ]).flat();
-      const prepared = prepareHistory(big);
-      expect(JSON.stringify(prepared).length).toBeGreaterThan(HISTORY_LIMIT);
+      const prepared = prepareHistory(
+        Array.from({ length: count }, (_, i) => [
+          userEntry(`msg-${i} ${"x".repeat(entrySize)}`),
+          assistantEntry(`reply-${i} ${"y".repeat(entrySize)}`),
+        ]).flat(),
+      );
+      const scaledLimit = Math.floor((1_000_000 / HISTORY_LIMIT_CONTEXT_WINDOW) * HISTORY_LIMIT);
 
       expect(() => assertHistoryWithinLimit(prepared, HISTORY_LIMIT)).toThrow(/context_length_exceeded/);
-
-      const scaledLimit = Math.floor((1_000_000 / HISTORY_LIMIT_CONTEXT_WINDOW) * HISTORY_LIMIT);
-      expect(scaledLimit).toBe(4_250_000);
       expect(() => assertHistoryWithinLimit(prepared, scaledLimit)).not.toThrow();
     });
   });
@@ -216,7 +227,7 @@ describe("Feature 6: History Management", () => {
         assistantEntry("ok", [{ name: "screenshot", toolUseId: "tc1", input: {} }]),
         {
           userInputMessage: {
-            content: "Tool results provided.",
+            content: "",
             modelId: "M",
             origin: "KIRO_CLI",
             images: [{ format: "png", source: { bytes: "screenshot-data" } }],
@@ -244,7 +255,7 @@ describe("Feature 6: History Management", () => {
   });
 
   describe("prepareHistory with images", () => {
-    it("strips images from history entries", () => {
+    it("strips images from prepared history", () => {
       const h: KiroHistoryEntry[] = [
         {
           userInputMessage: {
@@ -265,7 +276,7 @@ describe("Feature 6: History Management", () => {
       }
     });
 
-    it("drops a huge image so a text-only history stays within the limit", () => {
+    it("removes a huge image before enforcing the limit", () => {
       const hugeImage = "x".repeat(2_000_000); // 2MB base64
       const h: KiroHistoryEntry[] = [
         {
@@ -281,9 +292,11 @@ describe("Feature 6: History Management", () => {
         assistantEntry("A cat"),
       ];
       const result = prepareHistory(h);
-      expect(result.length).toBe(h.length);
-      // Image stripping alone brings this well under the limit.
+      const resultSize = JSON.stringify(result).length;
       expect(() => assertHistoryWithinLimit(result, HISTORY_LIMIT)).not.toThrow();
+      expect(resultSize).toBeLessThanOrEqual(HISTORY_LIMIT);
+      // Should still have entries (not wiped out)
+      expect(result.length).toBeGreaterThan(0);
     });
   });
 

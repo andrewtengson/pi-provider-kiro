@@ -8,11 +8,13 @@ import type {
   TextContent,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import { isContextOverflow } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
+import { validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
 import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
-import type { KiroHistoryEntry } from "../src/transform.js";
+import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
 import { concatMessages, encodeEventMessage } from "./helpers/event-stream.js";
 
 const ts = Date.now();
@@ -38,7 +40,7 @@ function makeModel(overrides?: Partial<TestKiroModel>): TestKiroModel {
     name: "Sonnet",
     api: "kiro-api",
     provider: "kiro",
-    baseUrl: "https://runtime.us-east-1.kiro.dev/",
+    baseUrl: "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
     reasoning: true,
     input: ["text", "image"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -56,24 +58,54 @@ function makeContext(userMsg = "Hello"): Context {
   };
 }
 
+function makeToolCall(id: string): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "toolCall", id, name: "read", arguments: { path: `/tmp/${id}` } }],
+    api: "kiro-api",
+    provider: "kiro",
+    model: "claude-sonnet-4-5",
+    usage: zeroUsage,
+    stopReason: "toolUse",
+    timestamp: ts,
+  };
+}
+
+function makeToolResult(id: string): ToolResultMessage {
+  return {
+    role: "toolResult",
+    toolCallId: id,
+    toolName: "read",
+    content: [{ type: "text", text: "x".repeat(300) }],
+    isError: false,
+    timestamp: ts,
+  };
+}
+
+function makeCompactedToolContext(): Context {
+  return {
+    systemPrompt: "SYSTEM_MARKER",
+    messages: [
+      {
+        role: "user",
+        content: "The conversation was compacted:\n\n<summary>COMPACTION_SUMMARY_MARKER</summary>",
+        timestamp: ts,
+      },
+      makeToolCall("tc1"),
+      makeToolResult("tc1"),
+      makeToolCall("tc2"),
+      makeToolResult("tc2"),
+      makeToolCall("tc3"),
+      makeToolResult("tc3"),
+    ],
+    tools: [{ name: "read", description: "Read a file", parameters: { type: "object", properties: {} } }],
+  };
+}
+
 function effortSchema(field: "reasoning" | "output_config", values: string[]): Record<string, unknown> {
   return {
     type: "object",
     properties: {
-      // Claude's live catalog schema pairs output_config.effort with a thinking
-      // block that offers display: "summarized"; GPT's exposes no thinking.
-      ...(field === "output_config"
-        ? {
-            thinking: {
-              type: "object",
-              properties: {
-                type: { type: "string", enum: ["adaptive", "disabled"] },
-                display: { type: "string", enum: ["summarized", "omitted"] },
-              },
-              required: ["type"],
-            },
-          }
-        : {}),
       [field]: {
         type: "object",
         properties: { effort: { type: "string", enum: values } },
@@ -115,9 +147,9 @@ function encodeBody(body: string): Uint8Array {
   return concatMessages(...parseJsonObjects(body).map((o) => encodeEventMessage(o)));
 }
 
-function makeFetchResponse(body: string) {
+function mockFetchOk(body: string) {
   const frames = encodeBody(body);
-  return {
+  return vi.fn().mockResolvedValueOnce({
     ok: true,
     body: {
       getReader: () => ({
@@ -129,11 +161,7 @@ function makeFetchResponse(body: string) {
       }),
       cancel: async () => {},
     },
-  };
-}
-
-function mockFetchOk(body: string) {
-  return vi.fn().mockResolvedValueOnce(makeFetchResponse(body));
+  });
 }
 
 function mockFetchChunked(chunks: string[]) {
@@ -181,10 +209,10 @@ describe("Feature 9: Streaming Integration", () => {
 
     expect(mockFetch).toHaveBeenCalledOnce();
     const [url, opts] = mockFetch.mock.calls[0];
-    expect(url).toBe("https://runtime.us-east-1.kiro.dev/");
+    expect(url).toBe("https://runtime.us-east-1.kiro.dev/generateAssistantResponse");
     expect(opts.method).toBe("POST");
     expect(opts.headers.Authorization).toBe("Bearer test-token");
-    expect(opts.headers["X-Amz-Target"]).toBe("AmazonCodeWhispererStreamingService.GenerateAssistantResponse");
+    expect(opts.headers["X-Amz-Target"]).toBeUndefined();
     expect(JSON.parse(opts.body).profileArn).toBeDefined();
 
     const done = events.find((e) => e.type === "done");
@@ -199,95 +227,208 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses a credential-projected profileArn without management discovery or a matching CLI token", async () => {
-    resetProfileArnCache(false);
-    const profileArn = "arn:aws:codewhisperer:us-east-1:123:profile/SOCIAL";
-    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+  it("emits native summarized thinking at max effort and preserves its signature", async () => {
+    const mockFetch = mockFetchOk(
+      '{"text":"Considering "}{"text":"divisibility"}{"signature":"opaque-signature"}{"content":"No"}{"contextUsagePercentage":10}',
+    );
     vi.stubGlobal("fetch", mockFetch);
 
-    const events = await collect(
-      streamKiro(makeModel({ kiroProfileArn: profileArn }), makeContext(), {
-        apiKey: "persisted-social-token",
-      }),
+    try {
+      const events = await collect(
+        streamKiro(
+          makeModel({
+            id: "claude-sonnet-5",
+            kiroModelId: "claude-sonnet-5",
+            thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+            additionalModelRequestFieldsSchema: {
+              type: "object",
+              properties: {
+                thinking: {
+                  type: "object",
+                  properties: { display: { type: "string", enum: ["summarized", "omitted"] } },
+                },
+                output_config: {
+                  type: "object",
+                  properties: { effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"] } },
+                },
+              },
+            },
+          }),
+          makeContext(),
+          { apiKey: "test-token", reasoning: "max" },
+        ),
+      );
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.additionalModelRequestFields).toEqual({
+        output_config: { effort: "max" },
+        thinking: { type: "adaptive", display: "summarized" },
+      });
+      const types = events.map((event) => event.type);
+      expect(types.indexOf("thinking_start")).toBeLessThan(types.indexOf("thinking_delta"));
+      expect(types.indexOf("thinking_delta")).toBeLessThan(types.indexOf("thinking_end"));
+      expect(types.indexOf("thinking_end")).toBeLessThan(types.indexOf("text_start"));
+      const done = events.find((event) => event.type === "done");
+      const thinking =
+        done?.type === "done" ? done.message.content.find((block) => block.type === "thinking") : undefined;
+      expect(thinking).toMatchObject({
+        type: "thinking",
+        thinking: "Considering divisibility",
+        thinkingSignature: "opaque-signature",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps visible-thinking markers when Claude uses structured adaptive effort", async () => {
+    const mockFetch = mockFetchOk(
+      '{"content":"<thinking>Checked divisibility</thinking>\\n\\nNo"}{"contextUsagePercentage":10}',
+    );
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const events = await collect(
+        streamKiro(
+          makeModel({
+            id: "claude-sonnet-4-6",
+            kiroModelId: "claude-sonnet-4.6",
+            additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "max"]),
+          }),
+          makeContext(),
+          { apiKey: "test-token", reasoning: "high" },
+        ),
+      );
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      const content = body.conversationState.currentMessage.userInputMessage.content;
+      expect(body.additionalModelRequestFields).toEqual({
+        output_config: { effort: "high" },
+        thinking: { type: "adaptive" },
+      });
+      expect(content).toContain("<thinking_mode>enabled</thinking_mode>");
+      expect(content).toContain("<max_thinking_length>30000</max_thinking_length>");
+      expect(events.some((event) => event.type === "thinking_delta")).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([
+    {
+      name: "maps GPT minimal to low",
+      model: {
+        id: "openai-gpt-5-6",
+        kiroModelId: "openai-gpt-5.6",
+        name: "GPT 5.6",
+        input: ["text"] as ("text" | "image")[],
+        thinkingLevelMap: { xhigh: "xhigh" },
+        additionalModelRequestFieldsSchema: effortSchema("reasoning", ["low", "medium", "high", "xhigh"]),
+      },
+      reasoning: "minimal" as const,
+      expected: { reasoning: { effort: "low" } },
+      visibleThinking: false,
+    },
+    {
+      name: "keeps GPT xhigh",
+      model: {
+        id: "openai-gpt-5-6",
+        kiroModelId: "openai-gpt-5.6",
+        name: "GPT 5.6",
+        input: ["text"] as ("text" | "image")[],
+        thinkingLevelMap: { xhigh: "xhigh" },
+        additionalModelRequestFieldsSchema: effortSchema("reasoning", ["low", "medium", "high", "xhigh"]),
+      },
+      reasoning: "xhigh" as const,
+      expected: { reasoning: { effort: "xhigh" } },
+      visibleThinking: false,
+    },
+    {
+      name: "keeps Claude xhigh distinct from max",
+      model: {
+        id: "claude-opus-4-8",
+        kiroModelId: "claude-opus-4.8",
+        name: "Claude Opus 4.8",
+        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+        additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"]),
+      },
+      reasoning: "xhigh" as const,
+      expected: { output_config: { effort: "xhigh" }, thinking: { type: "adaptive" } },
+      visibleThinking: true,
+    },
+    {
+      name: "maps Pi xhigh to Kiro max when xhigh is unavailable",
+      model: {
+        id: "claude-sonnet-4-6",
+        kiroModelId: "claude-sonnet-4.6",
+        name: "Claude Sonnet 4.6",
+        thinkingLevelMap: { max: "max" },
+        additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "max"]),
+      },
+      reasoning: "xhigh" as const,
+      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive" } },
+      visibleThinking: true,
+    },
+  ])("sends structured effort: $name", async ({ model, reasoning, expected, visibleThinking }) => {
+    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      await collect(streamKiro(makeModel(model), makeContext(), { apiKey: "test-token", reasoning }));
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.additionalModelRequestFields).toEqual(expected);
+      const content = body.conversationState.currentMessage.userInputMessage.content;
+      if (visibleThinking) {
+        expect(content).toContain("<thinking_mode>enabled</thinking_mode>");
+        expect(content).toContain("<max_thinking_length>");
+      } else {
+        expect(content).not.toContain("<thinking_mode>");
+        expect(content).not.toContain("<max_thinking_length>");
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("uses prompt injection only when a reasoning model has no structured effort mechanism", async () => {
+    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), makeContext(), { apiKey: "test-token", reasoning: "xhigh" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.additionalModelRequestFields).toBeUndefined();
+    expect(body.conversationState.currentMessage.userInputMessage.content).toContain(
+      "<max_thinking_length>50000</max_thinking_length>",
     );
 
-    expect(mockFetch).toHaveBeenCalledOnce();
-    expect(mockFetch.mock.calls[0][0]).toBe("https://runtime.us-east-1.kiro.dev/");
-    expect(JSON.parse(mockFetch.mock.calls[0][1].body).profileArn).toBe(profileArn);
-    expect(events.find((event) => event.type === "done")).toBeDefined();
-
     vi.unstubAllGlobals();
   });
 
-  it("fails before inference when profile discovery returns no profile", async () => {
-    resetProfileArnCache(false);
-    const mockFetch = vi.fn().mockResolvedValueOnce({
-      ok: true,
-      json: () => Promise.resolve({ profiles: [] }),
-    });
+  it("does not guess a known-model effort mechanism over a present catalog schema", async () => {
+    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
     vi.stubGlobal("fetch", mockFetch);
 
-    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+    await collect(
+      streamKiro(
+        makeModel({
+          id: "claude-opus-4-8",
+          kiroModelId: "claude-opus-4.8",
+          name: "Claude Opus 4.8",
+          thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+          additionalModelRequestFieldsSchema: { type: "object", properties: {}, additionalProperties: false },
+        }),
+        makeContext(),
+        { apiKey: "test-token", reasoning: "high" },
+      ),
+    );
 
-    expect(mockFetch).toHaveBeenCalledOnce();
-    expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/");
-    const error = events.find((event) => event.type === "error");
-    expect(error?.type === "error" && error.error.errorMessage).toContain("returned no profile");
-
-    vi.unstubAllGlobals();
-  });
-
-  it("fails before inference when profile discovery fails", async () => {
-    resetProfileArnCache(false);
-    const mockFetch = vi.fn().mockResolvedValueOnce({
-      ok: false,
-      status: 503,
-      statusText: "Service Unavailable",
-    });
-    vi.stubGlobal("fetch", mockFetch);
-
-    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
-
-    expect(mockFetch).toHaveBeenCalledOnce();
-    expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/");
-    const error = events.find((event) => event.type === "error");
-    expect(error?.type === "error" && error.error.errorMessage).toContain("ListAvailableProfiles failed");
-
-    vi.unstubAllGlobals();
-  });
-
-  it("derives the runtime and management region from baseUrl when kiroRegion is absent", async () => {
-    resetProfileArnCache(false);
-    const testArn = "arn:aws:codewhisperer:eu-central-1:123:profile/TEST";
-    const endpoint = "https://runtime.eu-central-1.kiro.dev/";
-    const mockFetch = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ profiles: [{ arn: testArn }] }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        body: {
-          getReader: () => ({
-            read: vi
-              .fn()
-              .mockResolvedValueOnce({
-                done: false,
-                value: encodeBody('{"content":"Hi"}{"contextUsagePercentage":5}'),
-              })
-              .mockResolvedValueOnce({ done: true, value: undefined }),
-            releaseLock: () => {},
-          }),
-        },
-      });
-    vi.stubGlobal("fetch", mockFetch);
-
-    const events = await collect(streamKiro(makeModel({ baseUrl: endpoint }), makeContext(), { apiKey: "tok" }));
-
-    expect(mockFetch.mock.calls[0][0]).toBe("https://management.eu-central-1.kiro.dev/");
-    expect(mockFetch.mock.calls[1][0]).toBe(endpoint);
-    expect(events.find((event) => event.type === "done")).toBeDefined();
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.additionalModelRequestFields).toBeUndefined();
+    expect(body.conversationState.currentMessage.userInputMessage.content).toContain(
+      "<thinking_mode>enabled</thinking_mode>",
+    );
 
     vi.unstubAllGlobals();
   });
@@ -324,8 +465,9 @@ describe("Feature 9: Streaming Integration", () => {
     await collect(stream);
 
     expect(mockFetch).toHaveBeenCalledTimes(2);
-    // First call is ListAvailableProfiles
-    expect(mockFetch.mock.calls[0][1].headers["X-Amz-Target"]).toBe("AmazonCodeWhispererService.ListAvailableProfiles");
+    // First call is ListAvailableProfiles on the management host.
+    expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
+    expect(mockFetch.mock.calls[0][1].headers["X-Amz-Target"]).toBeUndefined();
     // Second call includes profileArn in the body
     const body = JSON.parse(mockFetch.mock.calls[1][1].body);
     expect(body.profileArn).toBe(testArn);
@@ -338,6 +480,205 @@ describe("Feature 9: Streaming Integration", () => {
     expect(mockFetch2).toHaveBeenCalledOnce();
     const body2 = JSON.parse(mockFetch2.mock.calls[0][1].body);
     expect(body2.profileArn).toBe(testArn);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("uses a newer kiro-cli token when initial profile discovery returns 403", async () => {
+    resetProfileArnCache(false);
+    const freshProfileArn = "arn:aws:codewhisperer:us-east-1:123:profile/FRESH";
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ profiles: [{ arn: freshProfileArn }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: encodeBody('{"content":"recovered"}{"contextUsagePercentage":5}'),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            releaseLock: () => {},
+          }),
+        },
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const kiroCliModule = await import("../src/kiro-cli.js");
+    const freshCliCreds = {
+      refresh: "fresh-refresh|client|secret|idc",
+      access: "fresh-token",
+      expires: Date.now() + 3_600_000,
+      clientId: "client",
+      clientSecret: "secret",
+      region: "us-east-1",
+      authMethod: "idc" as const,
+    };
+    const getCredsSpy = vi.spyOn(kiroCliModule, "getKiroCliCredentials").mockReturnValue(freshCliCreds);
+    const refreshSpy = vi.spyOn(kiroCliModule, "refreshViaKiroCli").mockReturnValue(undefined);
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "stale-token" }));
+
+    expect(refreshSpy).not.toHaveBeenCalled();
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe("Bearer stale-token");
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(mockFetch.mock.calls[2][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(JSON.parse(mockFetch.mock.calls[2][1].body).profileArn).toBe(freshProfileArn);
+    expect(events.find((event) => event.type === "done")).toBeDefined();
+
+    getCredsSpy.mockRestore();
+    refreshSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("forces a kiro-cli refresh when profile discovery rejects the stored token", async () => {
+    resetProfileArnCache(false);
+    const freshProfileArn = "arn:aws:codewhisperer:us-east-1:123:profile/REFRESHED";
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: encodeBody('{"content":"recovered"}{"contextUsagePercentage":5}'),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            releaseLock: () => {},
+          }),
+        },
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const kiroCliModule = await import("../src/kiro-cli.js");
+    const staleCliCreds = {
+      refresh: "stale-refresh|client|secret|idc",
+      access: "stale-token",
+      expires: Date.now() + 3_600_000,
+      clientId: "client",
+      clientSecret: "secret",
+      region: "us-east-1",
+      authMethod: "idc" as const,
+    };
+    const freshCliCreds = { ...staleCliCreds, access: "fresh-token", profileArn: freshProfileArn };
+    const getCredsSpy = vi.spyOn(kiroCliModule, "getKiroCliCredentials").mockReturnValue(staleCliCreds);
+    const refreshSpy = vi.spyOn(kiroCliModule, "refreshViaKiroCli").mockReturnValue(freshCliCreds);
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "stale-token" }));
+
+    expect(refreshSpy).toHaveBeenCalledOnce();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe("Bearer stale-token");
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(JSON.parse(mockFetch.mock.calls[1][1].body).profileArn).toBe(freshProfileArn);
+    expect(events.find((event) => event.type === "done")).toBeDefined();
+
+    getCredsSpy.mockRestore();
+    refreshSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("uses a credential-projected profileArn without management discovery or a matching CLI token", async () => {
+    resetProfileArnCache(false);
+    const profileArn = "arn:aws:codewhisperer:us-east-1:123:profile/SOCIAL";
+    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(
+      streamKiro(makeModel({ kiroProfileArn: profileArn } as Partial<Model<Api>>), makeContext(), {
+        apiKey: "persisted-social-token",
+      }),
+    );
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(mockFetch.mock.calls[0][0]).toBe("https://runtime.us-east-1.kiro.dev/generateAssistantResponse");
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).profileArn).toBe(profileArn);
+    expect(events.find((event) => event.type === "done")).toBeDefined();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("fails before inference when profile discovery returns no profile", async () => {
+    resetProfileArnCache(false);
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ profiles: [] }),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
+    const error = events.find((event) => event.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("returned no profile");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("fails before inference when profile discovery fails", async () => {
+    resetProfileArnCache(false);
+    const mockFetch = vi.fn().mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      statusText: "Service Unavailable",
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
+    const error = events.find((event) => event.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("ListAvailableProfiles failed");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("derives the runtime and management region from baseUrl when kiroRegion is absent", async () => {
+    resetProfileArnCache(false);
+    const testArn = "arn:aws:codewhisperer:eu-central-1:123:profile/TEST";
+    const endpoint = "https://runtime.eu-central-1.kiro.dev/";
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ profiles: [{ arn: testArn }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({
+                done: false,
+                value: encodeBody('{"content":"Hi"}{"contextUsagePercentage":5}'),
+              })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            releaseLock: () => {},
+          }),
+        },
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel({ baseUrl: endpoint }), makeContext(), { apiKey: "tok" }));
+
+    expect(mockFetch.mock.calls[0][0]).toBe("https://management.eu-central-1.kiro.dev/List-Available-Profiles");
+    expect(mockFetch.mock.calls[1][0]).toBe(`${endpoint}generateAssistantResponse`);
+    expect(events.find((event) => event.type === "done")).toBeDefined();
 
     vi.unstubAllGlobals();
   });
@@ -415,166 +756,6 @@ describe("Feature 9: Streaming Integration", () => {
   // =========================================================================
   // Thinking + text streaming (pi-mono: stream.test.ts handleThinking)
   // =========================================================================
-
-  it.each([
-    {
-      name: "maps GPT minimal to low",
-      model: {
-        id: "openai-gpt-5-6",
-        kiroModelId: "openai-gpt-5.6",
-        name: "GPT 5.6",
-        input: ["text"] as ("text" | "image")[],
-        thinkingLevelMap: { xhigh: "xhigh" },
-        additionalModelRequestFieldsSchema: effortSchema("reasoning", ["low", "medium", "high", "xhigh"]),
-      },
-      reasoning: "minimal" as const,
-      expected: { reasoning: { effort: "low" } },
-    },
-    {
-      name: "keeps GPT xhigh",
-      model: {
-        id: "openai-gpt-5-6",
-        kiroModelId: "openai-gpt-5.6",
-        name: "GPT 5.6",
-        input: ["text"] as ("text" | "image")[],
-        thinkingLevelMap: { xhigh: "xhigh" },
-        additionalModelRequestFieldsSchema: effortSchema("reasoning", ["low", "medium", "high", "xhigh"]),
-      },
-      reasoning: "xhigh" as const,
-      expected: { reasoning: { effort: "xhigh" } },
-    },
-    {
-      name: "keeps Claude xhigh distinct from max",
-      model: {
-        id: "claude-opus-4-8",
-        kiroModelId: "claude-opus-4.8",
-        name: "Claude Opus 4.8",
-        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
-        additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"]),
-      },
-      reasoning: "xhigh" as const,
-      expected: { output_config: { effort: "xhigh" }, thinking: { type: "adaptive", display: "summarized" } },
-    },
-    {
-      name: "keeps Claude max distinct from xhigh",
-      model: {
-        id: "claude-opus-4-8",
-        kiroModelId: "claude-opus-4.8",
-        name: "Claude Opus 4.8",
-        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
-        additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "xhigh", "max"]),
-      },
-      reasoning: "max" as const,
-      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive", display: "summarized" } },
-    },
-    {
-      name: "uses the known Claude max fallback only when schema is unavailable",
-      model: {
-        id: "claude-opus-4-8",
-        kiroModelId: "claude-opus-4.8",
-        name: "Claude Opus 4.8",
-        thinkingLevelMap: { xhigh: "xhigh", max: "max" },
-      },
-      reasoning: "max" as const,
-      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive", display: "summarized" } },
-    },
-    {
-      name: "clamps the xhigh hole to max before building Claude fields",
-      model: {
-        id: "claude-sonnet-4-6",
-        kiroModelId: "claude-sonnet-4.6",
-        name: "Claude Sonnet 4.6",
-        thinkingLevelMap: { max: "max" },
-        additionalModelRequestFieldsSchema: effortSchema("output_config", ["low", "medium", "high", "max"]),
-      },
-      reasoning: "xhigh" as const,
-      expected: { output_config: { effort: "max" }, thinking: { type: "adaptive", display: "summarized" } },
-    },
-  ])("sends structured effort: $name", async ({ model, reasoning, expected }) => {
-    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
-    vi.stubGlobal("fetch", mockFetch);
-
-    try {
-      await collect(streamKiro(makeModel(model), makeContext(), { apiKey: "test-token", reasoning }));
-
-      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-      expect(body.additionalModelRequestFields).toEqual(expected);
-      const content = body.conversationState.currentMessage.userInputMessage.content;
-      expect(content).not.toContain("<thinking_mode>");
-      expect(content).not.toContain("<max_thinking_length>");
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-
-  it("uses prompt injection only when a reasoning model has no structured effort mechanism", async () => {
-    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
-    vi.stubGlobal("fetch", mockFetch);
-
-    await collect(streamKiro(makeModel(), makeContext(), { apiKey: "test-token", reasoning: "max" }));
-
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.additionalModelRequestFields).toBeUndefined();
-    expect(body.conversationState.currentMessage.userInputMessage.content).toContain(
-      "<max_thinking_length>70000</max_thinking_length>",
-    );
-
-    vi.unstubAllGlobals();
-  });
-
-  it("does not guess a known-model effort mechanism over a present catalog schema", async () => {
-    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
-    vi.stubGlobal("fetch", mockFetch);
-
-    await collect(
-      streamKiro(
-        makeModel({
-          id: "claude-opus-4-8",
-          kiroModelId: "claude-opus-4.8",
-          name: "Claude Opus 4.8",
-          thinkingLevelMap: { xhigh: "xhigh", max: "max" },
-          additionalModelRequestFieldsSchema: { type: "object", properties: {}, additionalProperties: false },
-        }),
-        makeContext(),
-        { apiKey: "test-token", reasoning: "high" },
-      ),
-    );
-
-    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-    expect(body.additionalModelRequestFields).toBeUndefined();
-    expect(body.conversationState.currentMessage.userInputMessage.content).toContain(
-      "<thinking_mode>enabled</thinking_mode>",
-    );
-
-    vi.unstubAllGlobals();
-  });
-
-  it("emits native reasoning as signed Pi thinking before text", async () => {
-    const mockFetch = mockFetchOk(
-      '{"text":"Considering "}{"text":"options"}{"signature":"signed-reasoning"}{"content":"Final answer"}{"contextUsagePercentage":10}',
-    );
-    vi.stubGlobal("fetch", mockFetch);
-
-    const events = await collect(
-      streamKiro(makeModel({ id: "claude-opus-4-8", reasoning: true }), makeContext(), {
-        apiKey: "tok",
-        reasoning: "high",
-      }),
-    );
-
-    expect(events.map((event) => event.type)).toEqual(
-      expect.arrayContaining(["thinking_start", "thinking_delta", "thinking_end", "text_start", "text_delta"]),
-    );
-    const done = events.find((event) => event.type === "done");
-    const thinking =
-      done?.type === "done" ? done.message.content.find((block) => block.type === "thinking") : undefined;
-    expect(thinking).toMatchObject({
-      type: "thinking",
-      thinking: "Considering options",
-      thinkingSignature: "signed-reasoning",
-    });
-    vi.unstubAllGlobals();
-  });
 
   it("emits thinking_start -> thinking_delta -> thinking_end -> text_start -> text_delta -> text_end for reasoning model", async () => {
     const mockFetch = mockFetchChunked([
@@ -1059,10 +1240,13 @@ describe("Feature 9: Streaming Integration", () => {
     expect(done).toBeDefined();
     expect(done?.type === "done" && done.message.stopReason).toBe("stop");
 
-    // Verify tool results were sent in the request body
+    // Verify tool results were sent in the request body. `content` is empty by
+    // design: Kiro's rule is content **or** toolResults, and this turn's payload
+    // is the toolResults. Filling it with prose would put a sentence the user
+    // never wrote into the conversation as a user utterance.
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     const currentMsg = body.conversationState.currentMessage.userInputMessage;
-    expect(currentMsg.content).toBe("Tool results provided.");
+    expect(currentMsg.content).toBe("");
     expect(currentMsg.userInputMessageContext?.toolResults).toHaveLength(1);
     expect(currentMsg.userInputMessageContext.toolResults[0].toolUseId).toBe("tc1");
 
@@ -1120,6 +1304,732 @@ describe("Feature 9: Streaming Integration", () => {
       | undefined;
     expect(tools).toBeDefined();
     expect(tools?.map((t) => t.toolSpecification.name)).toContain("calc");
+
+    vi.unstubAllGlobals();
+  });
+
+  // =========================================================================
+  // `content` on a payload-less turn vs. a tool turn
+  // ————————————————————————————————————————————————————————————————————
+  // Kiro's rule is content **or** tool results. A turn carrying neither has no
+  // payload at all — an image-only user message, an empty-text user message, or
+  // a host-appended message whose role falls outside pi-ai's `Message` union —
+  // and gets the neutral placeholder so its attachments still reach the model
+  // (#106).
+  //
+  // A tool turn is not that turn: its payload is
+  // `userInputMessageContext.toolResults`, so its `content` stays empty. Both
+  // cases share one line in the request builder, and the guard between them is
+  // load-bearing — see the mutation probe below.
+  // =========================================================================
+
+  // These use a prior turn so the system prompt is already consumed by the
+  // first history entry: on the very first message the prompt is prepended to
+  // the current content, which masks an empty text payload.
+  const settledTurn = (): Context["messages"] => [
+    { role: "user", content: "earlier question", timestamp: ts },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "earlier answer" }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    } satisfies AssistantMessage,
+  ];
+
+  it("sends placeholder content for an image-only user message", async () => {
+    const image: ImageContent = { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [...settledTurn(), { role: "user", content: [image], timestamp: ts }],
+      tools: [],
+    };
+    const mockFetch = mockFetchOk('{"content":"Nice picture."}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+    // The image itself must still reach the model.
+    expect(currentMsg.images).toHaveLength(1);
+    expect(events.some((event) => event.type === "done")).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("sends placeholder content for an empty-text user message", async () => {
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [...settledTurn(), { role: "user", content: "", timestamp: ts }],
+      tools: [],
+    };
+    const mockFetch = mockFetchOk('{"content":"Go on."}{"contextUsagePercentage":1}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps real user text untouched", async () => {
+    const mockFetch = mockFetchOk('{"content":"Hi."}{"contextUsagePercentage":1}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), makeContext("Explain this repo"), { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).toContain("Explain this repo");
+
+    vi.unstubAllGlobals();
+  });
+
+  // -----------------------------------------------------------------------
+  // The tool-turn side of the same line.
+  //
+  // MUTATION PROBE for the `currentToolResults.length === 0` guard on the
+  // placeholder fallback in stream.ts: widen that condition back to a bare
+  // `if (currentContent === "")` and these three go red with
+  // `EMPTY_CONTENT_PLACEHOLDER` in place of `""`. Without them the whole change
+  // passes while every tool turn is refilled with a different fabricated
+  // sentence — a no-op with new wording.
+  // -----------------------------------------------------------------------
+
+  it("sends empty content on a tool-result turn, with the results as payload", async () => {
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc1", name: "calc", arguments: { a: 2 } }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tc1",
+          toolName: "calc",
+          content: [{ type: "text", text: "4" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"4."}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).toBe("");
+    expect(currentMsg.userInputMessageContext.toolResults).toHaveLength(1);
+    expect(currentMsg.userInputMessageContext.toolResults[0].toolUseId).toBe("tc1");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("sends empty content when the turn is tool results alone", async () => {
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc9", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tc9",
+          toolName: "calc",
+          content: [{ type: "text", text: "9" }],
+          isError: false,
+          timestamp: ts,
+        },
+        {
+          role: "toolResult",
+          toolCallId: "tc9",
+          toolName: "calc",
+          content: [{ type: "text", text: "9 again" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"9."}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).toBe("");
+    expect(currentMsg.userInputMessageContext.toolResults.length).toBeGreaterThan(0);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("never puts carrier prose anywhere in a tool-turn request", async () => {
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc1", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const secondAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tc2", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const tr = (id: string, text: string): Context["messages"][number] => ({
+      role: "toolResult",
+      toolCallId: id,
+      toolName: "calc",
+      content: [{ type: "text", text }],
+      isError: false,
+      timestamp: ts,
+    });
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "do the thing", timestamp: ts },
+        assistantWithTool,
+        tr("tc1", "one"),
+        secondAssistant,
+        tr("tc2", "two"),
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"done"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const body = mockFetch.mock.calls[0][1].body as string;
+    expect(body).not.toContain("Tool results provided");
+    // The one real user utterance survives verbatim.
+    const parsed = JSON.parse(body);
+    expect(parsed.conversationState.history[0].userInputMessage.content).toContain("do the thing");
+
+    vi.unstubAllGlobals();
+  });
+
+  // -----------------------------------------------------------------------
+  // The pre-send REPAIR, exercised through `streamKiro` rather than through
+  // `repairKiroConversation` directly. Unit tests on the validator prove the
+  // rules; only these prove the request builder actually runs them and sends
+  // the repaired bytes.
+  //
+  // MUTATION PROBE: delete the `kiroConversationEntries`/
+  // `repairKiroConversation` block in stream.ts and these go red. Nothing else
+  // in the suite does — `tsc` still passes and biome reports the orphaned
+  // imports as a warning with exit 0.
+  //
+  // Reachability: `sanitizeHistory` repairs orphaned results inside `history`
+  // by synthesizing an `unknown_tool` toolUse, but it tests pairing by POSITION,
+  // so a mismatched PAIR — both partners present, each paired with the other's
+  // counterpart — passes it untouched, and the current message is assembled
+  // after that pass and is not covered by it at all. Both shapes reach the wire
+  // as `400 TOOL_USE_RESULT_MISMATCH` unless repaired here.
+  // -----------------------------------------------------------------------
+
+  // -----------------------------------------------------------------------
+  // The live wedge, 2026-08-14. Two concurrent tool executions interleaved into
+  // one transcript, so a tool result landed paired with the WRONG assistant's
+  // tool use:
+  //
+  //   assistant(toolUses=[A]) / user(text) / assistant(toolUses=[B]) / user(results=[A])
+  //
+  // Kiro answered `400 ... tool_use ids were found without tool_result blocks
+  // immediately after: <B>` and, because the retry resends identical history,
+  // the session was terminally wedged — every subsequent turn 400d.
+  //
+  // `prepareHistory` cannot see it: `sanitizeHistory` tests pairing by POSITION,
+  // and `injectSyntheticToolCalls` only rescues orphaned RESULTS.
+  // -----------------------------------------------------------------------
+  // The branch where repair legitimately removes `userInputMessageContext`
+  // entirely: the carrier's results answer nothing, and the turn declares no
+  // tools, so after stripping there is nothing left to put in the context. This
+  // is the shape a `?? uimc` fallback silently undoes.
+  //
+  // No tools are declared and history contains no `toolUses`, so
+  // `addPlaceholderTools` synthesizes none either — that is what makes the
+  // repaired context empty rather than tools-only.
+  //
+  // MUTATION PROBE: change `wireUimc = repairedCurrent.userInputMessageContext`
+  // to `... ?? uimc` in stream.ts and this goes red — the stripped orphan is put
+  // straight back onto the wire.
+  it("sends no tool context at all when repair strips the only results", async () => {
+    const settledAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Done." }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "do it", timestamp: ts },
+        settledAssistant,
+        // Answers `tcZ`, which no assistant turn ever issued.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const current = sent.conversationState.currentMessage.userInputMessage;
+    expect(current.userInputMessageContext).toBeUndefined();
+    // With no payload left, step 5 gives the turn the neutral prompt.
+    expect(current.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+    const conversation = [...(sent.conversationState.history ?? []), { userInputMessage: current }];
+    expect(validateKiroConversation(conversation).valid).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not flatten reasoning into the current turn's assistant content", async () => {
+    // The history site (`buildHistory`) stopped flattening earlier; this is the
+    // OTHER site, in the current-message assistant branch. It reaches the wire
+    // through the same `assistantResponseMessage.content`, so leaving it flattened
+    // made the parity claim only half true.
+    const withThinking: AssistantMessage = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "deciding which file to read" } as unknown as TextContent,
+        { type: "text", text: "reading it now" },
+        { type: "toolCall", id: "tc9", name: "read", arguments: { path: "/tmp/tc9" } },
+      ],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    } as AssistantMessage;
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [...settledTurn(), withThinking, makeToolResult("tc9")],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const entry = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "tc9"),
+    );
+    expect(entry).toBeDefined();
+    // The reasoning is gone from the text channel, the real text survives, and the
+    // structured tool use is untouched.
+    expect(entry?.assistantResponseMessage?.content).not.toContain("<thinking>");
+    expect(entry?.assistantResponseMessage?.content).not.toContain("deciding which file to read");
+    expect(entry?.assistantResponseMessage?.content).toContain("reading it now");
+    expect(entry?.assistantResponseMessage?.toolUses?.[0]?.name).toBe("read");
+    // Nothing anywhere in the request carries the markup.
+    expect(JSON.stringify(sent)).not.toContain("<thinking>");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not append a bare separator when merging an empty current turn into a previous assistant", async () => {
+    // A current turn carrying only a toolCall leaves `armContent === ""`. Merging
+    // that into the preceding assistant with an unconditional `\n\n` appends a
+    // dangling separator onto text the model actually produced.
+    //
+    // Reaching the merge branch needs the LAST history entry to be an assistant
+    // with no `userInputMessage`, so the fixture puts two assistant turns back to
+    // back with no tool result between them. A tool-result carrier in between ends
+    // history on a user entry and takes the push branch instead, which is what an
+    // earlier version of this test did — it passed against the unconditional
+    // separator and proved nothing.
+    const plainAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "earlier answer" }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "go", timestamp: ts },
+        plainAssistant,
+        makeToolCall("tcB"),
+        makeToolResult("tcB"),
+      ],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const merged = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "tcB"),
+    );
+    // The merge happened onto the real text, and it is byte-identical.
+    expect(merged?.assistantResponseMessage?.content).toBe("earlier answer");
+    for (const entry of sent.conversationState.history ?? []) {
+      const content = entry.assistantResponseMessage?.content;
+      if (typeof content !== "string") continue;
+      expect(content).not.toMatch(/\n\n$/);
+    }
+
+    vi.unstubAllGlobals();
+  });
+
+  it("repairs the live mismatched-pair wedge so it no longer earns a 400", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "build it", timestamp: ts },
+        makeToolCall("A"),
+        { role: "user", content: "continue", timestamp: ts },
+        makeToolCall("B"),
+        {
+          role: "toolResult",
+          toolCallId: "A",
+          toolName: "read",
+          content: [{ type: "text", text: "REAL_OUTPUT_A" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const current = sent.conversationState.currentMessage.userInputMessage;
+    const conversation = [...(sent.conversationState.history ?? []), { userInputMessage: current }];
+
+    // The 400 is gone. `B` — the toolUse the backend named — is answered, and no
+    // result answering nothing is left on the wire. This is the whole point: the
+    // request is now one the backend accepts, so the session is not wedged.
+    expect(validateKiroToolStructure(conversation).valid).toBe(true);
+    expect(current.userInputMessageContext.toolResults).toHaveLength(1);
+    expect(current.userInputMessageContext.toolResults[0].toolUseId).toBe("B");
+    expect(current.userInputMessageContext.toolResults[0].status).toBe("error");
+    // `B` is answered rather than dropped, so the model still sees that its call
+    // was issued and did not complete.
+    const armToolUses = (sent.conversationState.history ?? []).flatMap(
+      (h: KiroHistoryEntry) => h.assistantResponseMessage?.toolUses ?? [],
+    );
+    expect(armToolUses.map((tu: { toolUseId: string }) => tu.toolUseId)).toContain("B");
+
+    // ---- What relocation preserves, and what it still costs. ----
+    //
+    // 1. `A`'s real output SURVIVES. `relocateDisplacedToolResults` moves the
+    //    displaced result back behind the assistant that issued it, before
+    //    anything positional runs, so `sanitizeHistory` no longer drops that
+    //    assistant and the result is no longer orphaned. This is a pure reorder:
+    //    nothing is fabricated and nothing is dropped.
+    expect(JSON.stringify(sent)).toContain("REAL_OUTPUT_A");
+    const historyResults = (sent.conversationState.history ?? []).flatMap(
+      (h: KiroHistoryEntry) => h.userInputMessage?.userInputMessageContext?.toolResults ?? [],
+    );
+    const resultA = historyResults.find((tr: { toolUseId: string }) => tr.toolUseId === "A");
+    expect(resultA).toBeDefined();
+    expect(resultA.status).toBe("success");
+    expect(resultA.content[0].text).toBe("REAL_OUTPUT_A");
+    // Paired with the assistant that actually issued it, which is what makes the
+    // request acceptable rather than merely present in the bytes.
+    const aIdx = (sent.conversationState.history ?? []).findIndex((h: KiroHistoryEntry) =>
+      h.assistantResponseMessage?.toolUses?.some((tu) => tu.toolUseId === "A"),
+    );
+    const afterA = (sent.conversationState.history ?? [])[aIdx + 1];
+    expect(afterA?.userInputMessage?.userInputMessageContext?.toolResults?.[0]?.toolUseId).toBe("A");
+    //
+    // 2. The real user interjection survives VERBATIM. Merging it into the
+    //    now-empty carrier must not prepend a separator: `"continue"`, never
+    //    `"\n\ncontinue"`. Fabricating whitespace onto a message the user wrote is
+    //    the same defect class as the carrier prose this change removes.
+    const interjection = (sent.conversationState.history ?? []).find((h: KiroHistoryEntry) =>
+      h.userInputMessage?.userInputMessageContext?.toolResults?.some((tr) => tr.toolUseId === "A"),
+    );
+    expect(interjection?.userInputMessage?.content).toBe("continue");
+    //
+    // 3. Wire chronology shifts, and that is the accepted cost. The interjection
+    //    was said BEFORE `A`'s result arrived, but appears after it on the wire,
+    //    because relocation moves the result and not the user turn. A fidelity
+    //    loss, not a fabrication, and strictly less lossy than discarding real
+    //    tool output the model is waiting on.
+    expect(aIdx).toBeLessThan(
+      (sent.conversationState.history ?? []).findIndex(
+        (h: KiroHistoryEntry) => h.userInputMessage?.content === "continue",
+      ),
+    );
+    //
+    // 4. `B` is still answered synthetically. Relocation makes `B` the trailing
+    //    turn with nothing after it, so repair supplies its missing result — the
+    //    same synthesis emitted before relocation existed. Relocation changes
+    //    which output is PRESERVED, not how much is fabricated.
+    //
+    // 5. All seven rules now pass for this shape — a better outcome than
+    //    relocation was expected to deliver. Before relocation the interjection
+    //    left two consecutive user entries and `ALTERNATING_MESSAGES` survived as
+    //    an unrepairable residual. Relocation moves `A`'s result to sit directly
+    //    behind `A`, and the interjection then merges INTO that carrier entry
+    //    rather than following it, so one user entry now carries both `A`'s real
+    //    result and the user's verbatim text. Alternation holds as a consequence.
+    //
+    //    This is asserted rather than assumed: it is the reason the residual list
+    //    is empty, and if a future change reintroduces a separate interjection
+    //    entry this goes red rather than silently regressing to a residual.
+    const residual = validateKiroConversation(conversation).errors;
+    expect(residual).toEqual([]);
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("repairs an outbound tool structure that violates an invariant", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tcA", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        // Answers `tcZ`, which no preceding toolUse issued.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    // Repaired, not merely reported: the orphan `tcZ` result is stripped and
+    // `tcA` — which nothing answered — gets a synthetic failure result, so the
+    // conversation that reaches the wire satisfies all seven rules.
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const conversation = [
+      ...(sent.conversationState.history ?? []),
+      { userInputMessage: sent.conversationState.currentMessage.userInputMessage },
+    ];
+    expect(validateKiroConversation(conversation).valid).toBe(true);
+    const sentResults = sent.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults;
+    expect(sentResults?.map((tr: { toolUseId: string }) => tr.toolUseId)).toEqual(["tcA"]);
+    expect(sentResults?.[0].status).toBe("error");
+    // Nothing survived repair, so nothing is warned about.
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("stays silent on a well-formed tool turn", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const assistantWithTool: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "tcA", name: "calc", arguments: {} }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        ...settledTurn(),
+        assistantWithTool,
+        {
+          role: "toolResult",
+          toolCallId: "tcA",
+          toolName: "calc",
+          content: [{ type: "text", text: "7" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  // Probed 2026-08-11 before this test existed: this context reached the wire as
+  // `currentMessage.userInputMessage` with populated `toolResults`, no `history`
+  // at all, and no `toolUse` anywhere — the exact shape the backend rejects as
+  // `TOOL_USE_RESULT_MISMATCH` — while the invariant check stayed silent, because
+  // the pairwise walk only inspects a carrier that follows an assistant entry.
+  //
+  // It is now repaired rather than warned about. This is also the one shape that
+  // repair COLLAPSES: the whole conversation is a single bare carrier, so step 1
+  // finds no valid opening entry and consumes it. `stream.ts` handles that
+  // explicitly — strip the results that answer nothing, keep the tool catalog,
+  // and fall back to the neutral prompt.
+  //
+  // MUTATION PROBE: restore `wireUimc = repairedCurrent?.userInputMessageContext ?? uimc`
+  // and this goes red — the fallback puts the stripped orphan straight back.
+  it("repairs a tool-result carrier that has no toolUse anywhere", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        // No assistant turn ever issued `tcZ`. `sanitizeHistory` cannot repair
+        // this one: the carrier is the current message, not a history entry.
+        {
+          role: "toolResult",
+          toolCallId: "tcZ",
+          toolName: "calc",
+          content: [{ type: "text", text: "orphan" }],
+          isError: false,
+          timestamp: ts,
+        },
+      ],
+      tools: [{ name: "calc", description: "Calculate", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":2}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(
+      streamKiro(makeModel({ kiroProfileArn: "arn:aws:codewhisperer:us-east-1:0:profile/X" }), context, {
+        apiKey: "tok",
+      }),
+    );
+
+    const sent = JSON.parse(mockFetch.mock.calls[0][1].body as string);
+    const currentMsg = sent.conversationState.currentMessage.userInputMessage;
+    // The orphan is gone — sending it is what earns the 400.
+    expect(currentMsg.userInputMessageContext?.toolResults ?? []).toHaveLength(0);
+    // The tool catalog survives, and the turn still has a payload.
+    expect(currentMsg.userInputMessageContext?.tools).toBeDefined();
+    expect(currentMsg.content).toBe(EMPTY_CONTENT_PLACEHOLDER);
+    expect(sent.conversationState.history ?? []).toHaveLength(0);
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).not.toContain("outbound history");
+
+    warnSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  // The observed failure: a host appended a reminder message carrying a role
+  // outside pi-ai's `Message` union ("developer") after a settled assistant
+  // turn. None of the current-message branches matched it, so `content` went
+  // out empty and Kiro answered 400 REQUEST_BODY_INVALID — which the provider
+  // then relabeled `context_length_exceeded`, sending the caller into a
+  // compaction loop against a request that was structurally invalid, not large.
+  it("sends placeholder content when the turn ends on an unrecognized role", async () => {
+    const settledAssistant: AssistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "Done." }],
+      api: "kiro-api",
+      provider: "kiro",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: ts,
+    };
+    const reminder = {
+      role: "developer",
+      content: [{ type: "text", text: "<system-reminder>2 incomplete todos</system-reminder>" }],
+      attribution: "agent",
+      timestamp: ts,
+    };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "Do the work", timestamp: ts },
+        settledAssistant,
+        reminder as unknown as Context["messages"][number],
+      ],
+      tools: [],
+    };
+    const mockFetch = mockFetchOk('{"content":"Continuing."}{"contextUsagePercentage":4}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const currentMsg = JSON.parse(mockFetch.mock.calls[0][1].body).conversationState.currentMessage.userInputMessage;
+    expect(currentMsg.content).not.toBe("");
+    expect(events.some((event) => event.type === "done")).toBe(true);
+    expect(events.some((event) => event.type === "error")).toBe(false);
 
     vi.unstubAllGlobals();
   });
@@ -1411,6 +2321,55 @@ describe("Feature 9: Streaming Integration", () => {
   });
 
   // =========================================================================
+  // Local overflow recovery and post-compaction context preservation
+  // =========================================================================
+
+  it("sends the system/compaction anchor and complete tool groups when within budget", async () => {
+    const mockFetch = mockFetchOk('{"content":"Done"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const events = await collect(streamKiro(makeModel(), makeCompactedToolContext(), { apiKey: "tok" }));
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const history = body.conversationState.history as KiroHistoryEntry[];
+    const historyText = JSON.stringify(history);
+    const toolUseIds = history
+      .flatMap((entry) => entry.assistantResponseMessage?.toolUses ?? [])
+      .map((t) => t.toolUseId);
+    const historyResultIds = history
+      .flatMap((entry) => entry.userInputMessage?.userInputMessageContext?.toolResults ?? [])
+      .map((result) => result.toolUseId);
+    const currentResultIds = (
+      body.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults ?? []
+    ).map((result: { toolUseId: string }) => result.toolUseId);
+
+    expect(events.some((event) => event.type === "done")).toBe(true);
+    expect(historyText.match(/SYSTEM_MARKER/g) ?? []).toHaveLength(1);
+    expect(historyText.match(/COMPACTION_SUMMARY_MARKER/g) ?? []).toHaveLength(1);
+    expect(toolUseIds).toEqual(["tc1", "tc2", "tc3"]);
+    expect(historyResultIds).toEqual(["tc1", "tc2"]);
+    expect(currentResultIds).toEqual(["tc3"]);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("returns a Pi-recognized overflow without sending or dropping compacted context", async () => {
+    const mockFetch = vi.fn();
+    vi.stubGlobal("fetch", mockFetch);
+    const model = makeModel({ contextWindow: 100 });
+
+    const events = await collect(streamKiro(model, makeCompactedToolContext(), { apiKey: "tok" }));
+    const error = events.find((event) => event.type === "error");
+    const message = error?.type === "error" ? error.error : undefined;
+
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(message?.errorMessage).toMatch(/context_length_exceeded.*local history/);
+    expect(message?.errorMessage).not.toContain("COMPACTION_SUMMARY_MARKER");
+    expect(message && isContextOverflow(message, model.contextWindow)).toBe(true);
+
+    vi.unstubAllGlobals();
+  });
+
+  // =========================================================================
   // Overflow error message formatting (context_length_exceeded)
   // =========================================================================
 
@@ -1469,6 +2428,31 @@ describe("Feature 9: Streaming Integration", () => {
     const error = events.find((e) => e.type === "error");
     expect(error).toBeDefined();
     expect(error?.type === "error" && error.error.errorMessage).toContain("context_length_exceeded");
+
+    vi.unstubAllGlobals();
+  });
+
+  // A malformed-body 400 is not an overflow. Reporting it as one sends the
+  // caller into a compaction loop that can never clear the error, because the
+  // request is invalid rather than oversized.
+  it("does NOT report 400 'Improperly formed request' as a context overflow", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      statusText: "Bad Request",
+      text: () => Promise.resolve('{"message":"Improperly formed request.","reason":"REQUEST_BODY_INVALID"}'),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const model = makeModel();
+    const events = await collect(streamKiro(model, makeContext(), { apiKey: "tok" }));
+    const error = events.find((e) => e.type === "error");
+    const message = error?.type === "error" ? error.error : undefined;
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(message?.errorMessage).not.toContain("context_length_exceeded");
+    expect(message?.errorMessage).toContain("Improperly formed request.");
+    expect(message && isContextOverflow(message, model.contextWindow)).toBe(false);
 
     vi.unstubAllGlobals();
   });
@@ -1691,28 +2675,6 @@ describe("Feature 9: Streaming Integration", () => {
   // First-token timeout (Task 1.2)
   // =========================================================================
 
-  it("clears the first-token timeout after a successful first event", async () => {
-    const originalTimeout = retryConfig.firstTokenTimeoutMs;
-    retryConfig.firstTokenTimeoutMs = 90_000;
-    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
-    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
-    const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
-    vi.stubGlobal("fetch", mockFetch);
-
-    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
-    await collect(stream);
-
-    const firstTokenTimerIndex = setTimeoutSpy.mock.calls.findIndex((call) => call[1] === 90_000);
-    expect(firstTokenTimerIndex).toBeGreaterThanOrEqual(0);
-    const firstTokenTimer = setTimeoutSpy.mock.results[firstTokenTimerIndex]?.value;
-    expect(clearTimeoutSpy).toHaveBeenCalledWith(firstTokenTimer);
-
-    setTimeoutSpy.mockRestore();
-    clearTimeoutSpy.mockRestore();
-    retryConfig.firstTokenTimeoutMs = originalTimeout;
-    vi.unstubAllGlobals();
-  });
-
   it("retries when first token times out then succeeds on second attempt", async () => {
     const originalTimeout = retryConfig.firstTokenTimeoutMs;
     retryConfig.firstTokenTimeoutMs = 100;
@@ -1933,7 +2895,152 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
-  it("refreshes token from kiro-cli on 403 before retrying", async () => {
+  it("refreshes rejected CLI credentials and re-resolves the profile before retrying runtime", async () => {
+    resetProfileArnCache(false);
+    const staleProfileArn = "arn:aws:codewhisperer:us-east-1:123:profile/STALE";
+    const freshProfileArn = "arn:aws:codewhisperer:us-east-1:123:profile/FRESH";
+    const successFrames = encodeBody('{"content":"ok"}{"contextUsagePercentage":5}');
+    const mockFetch = vi
+      .fn()
+      // Runtime rejects the token and profile projected from the original credentials.
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        text: () => Promise.resolve("Access denied"),
+      })
+      // The fresh token resolves a fresh profile through management.
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ profiles: [{ arn: freshProfileArn }] }),
+      })
+      // Runtime succeeds with both refreshed identity values.
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({ done: false, value: successFrames })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            releaseLock: () => {},
+          }),
+        },
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const kiroCliModule = await import("../src/kiro-cli.js");
+    const staleCliCreds = {
+      refresh: "stale-refresh|client|secret|idc",
+      access: "stale-token",
+      expires: Date.now() + 3_600_000,
+      clientId: "client",
+      clientSecret: "secret",
+      region: "us-east-1",
+      authMethod: "idc" as const,
+      profileArn: staleProfileArn,
+    };
+    const freshCliCreds = {
+      ...staleCliCreds,
+      refresh: "fresh-refresh|client|secret|idc",
+      access: "fresh-token",
+      profileArn: undefined,
+    };
+    const getCredsSpy = vi.spyOn(kiroCliModule, "getKiroCliCredentials").mockReturnValue(staleCliCreds);
+    const refreshSpy = vi.spyOn(kiroCliModule, "refreshViaKiroCli").mockReturnValue(freshCliCreds);
+
+    const stream = streamKiro(makeModel({ kiroProfileArn: staleProfileArn }), makeContext(), {
+      apiKey: "stale-token",
+    });
+    const events = await collect(stream);
+
+    expect(refreshSpy).toHaveBeenCalledOnce();
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockFetch.mock.calls.map(([url]) => url)).toEqual([
+      "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+      "https://management.us-east-1.kiro.dev/List-Available-Profiles",
+      "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+    ]);
+    expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe("Bearer stale-token");
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).profileArn).toBe(staleProfileArn);
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(mockFetch.mock.calls[2][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(JSON.parse(mockFetch.mock.calls[2][1].body).profileArn).toBe(freshProfileArn);
+    expect(events.find((event) => event.type === "done")).toBeDefined();
+
+    getCredsSpy.mockRestore();
+    refreshSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("preserves a known social profile across desktop credential rotation", async () => {
+    resetProfileArnCache(false);
+    const socialProfileArn = "arn:aws:codewhisperer:us-east-1:123:profile/SOCIAL";
+    const successFrames = encodeBody('{"content":"ok"}{"contextUsagePercentage":5}');
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        statusText: "Forbidden",
+        text: () => Promise.resolve("Access denied"),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: vi
+              .fn()
+              .mockResolvedValueOnce({ done: false, value: successFrames })
+              .mockResolvedValueOnce({ done: true, value: undefined }),
+            releaseLock: () => {},
+          }),
+        },
+      });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const kiroCliModule = await import("../src/kiro-cli.js");
+    const staleSocialCreds = {
+      refresh: "stale-social-refresh|desktop",
+      access: "stale-social-token",
+      expires: Date.now() + 3_600_000,
+      clientId: "",
+      clientSecret: "",
+      region: "us-east-1",
+      authMethod: "desktop" as const,
+      profileArn: socialProfileArn,
+    };
+    const refreshedSocialCreds = {
+      ...staleSocialCreds,
+      refresh: "fresh-social-refresh|desktop",
+      access: "fresh-social-token",
+      profileArn: undefined,
+    };
+    const getCredsSpy = vi.spyOn(kiroCliModule, "getKiroCliCredentials").mockReturnValue(staleSocialCreds);
+    const refreshSpy = vi.spyOn(kiroCliModule, "refreshViaKiroCli").mockReturnValue(refreshedSocialCreds);
+
+    const events = await collect(
+      streamKiro(makeModel({ kiroProfileArn: socialProfileArn }), makeContext(), {
+        apiKey: "stale-social-token",
+      }),
+    );
+
+    expect(refreshSpy).toHaveBeenCalledOnce();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls.map(([url]) => url)).toEqual([
+      "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+      "https://runtime.us-east-1.kiro.dev/generateAssistantResponse",
+    ]);
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer fresh-social-token");
+    expect(JSON.parse(mockFetch.mock.calls[1][1].body).profileArn).toBe(socialProfileArn);
+    expect(events.find((event) => event.type === "done")).toBeDefined();
+
+    getCredsSpy.mockRestore();
+    refreshSpy.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("fails the 403 retry when refreshed profile discovery fails", async () => {
     // Start with unresolved cache so profileArn resolution runs
     resetProfileArnCache(false);
     const mockFetch = vi
@@ -1950,26 +3057,11 @@ describe("Feature 9: Streaming Integration", () => {
         statusText: "Forbidden",
         text: () => Promise.resolve('{"message":"The bearer token included in the request is invalid."}'),
       })
-      // 3rd call: ListAvailableProfiles (re-resolved after credential refresh)
+      // 3rd call: ListAvailableProfiles fails after credential refresh
       .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:123:profile/TEST" }] }),
-      })
-      // 4th call: generateAssistantResponse retry
-      .mockResolvedValueOnce({
-        ok: true,
-        body: {
-          getReader: () => ({
-            read: vi
-              .fn()
-              .mockResolvedValueOnce({
-                done: false,
-                value: encodeBody('{"content":"ok"}{"contextUsagePercentage":5}'),
-              })
-              .mockResolvedValueOnce({ done: true, value: undefined }),
-            releaseLock: () => {},
-          }),
-        },
+        ok: false,
+        status: 503,
+        statusText: "Service Unavailable",
       });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -1988,16 +3080,17 @@ describe("Feature 9: Streaming Integration", () => {
     const stream = streamKiro(makeModel(), makeContext(), { apiKey: "stale-token" });
     const events = await collect(stream);
 
-    expect(mockFetch).toHaveBeenCalledTimes(4);
-    // 1st: ListAvailableProfiles with stale token
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    // 1st: ListAvailableProfiles with stale token on management.
+    expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
     expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe("Bearer stale-token");
     // 2nd: generateAssistantResponse with stale token → 403
     expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer stale-token");
-    // 3rd: ListAvailableProfiles re-resolved with fresh token
+    // 3rd: ListAvailableProfiles fails with the fresh token on management.
+    expect(mockFetch.mock.calls[2][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
     expect(mockFetch.mock.calls[2][1].headers.Authorization).toBe("Bearer fresh-access-token");
-    // 4th: generateAssistantResponse retry with fresh token
-    expect(mockFetch.mock.calls[3][1].headers.Authorization).toBe("Bearer fresh-access-token");
-    expect(events.find((e) => e.type === "done")).toBeDefined();
+    const error = events.find((event) => event.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("ListAvailableProfiles failed");
 
     getCredsSpy.mockRestore();
     vi.unstubAllGlobals();
@@ -2153,47 +3246,17 @@ describe("Feature 9: Streaming Integration", () => {
   // Truncation recovery (Task 4.1)
   // =========================================================================
 
-  it("retries once when text-only output ends without contextUsage", async () => {
-    const mockFetch = vi
-      .fn()
-      .mockResolvedValueOnce(makeFetchResponse('{"content":"partial progress"}'))
-      .mockResolvedValueOnce(
-        makeFetchResponse(
-          '{"name":"bash","toolUseId":"tc1","input":"{\\"command\\":\\"pwd\\"}","stop":true}{"contextUsagePercentage":10}',
-        ),
-      );
+  it("sets stopReason to length when stream ends without contextUsage event", async () => {
+    // Stream that ends without contextUsagePercentage event
+    const mockFetch = mockFetchOk('{"content":"partial response that got cut off"}');
     vi.stubGlobal("fetch", mockFetch);
 
-    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
-    const done = events.find((event) => event.type === "done");
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
 
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-    expect(done?.type === "done" && done.message.stopReason).toBe("toolUse");
-    expect(done?.type === "done" && done.message.content.some((block) => block.type === "toolCall")).toBe(true);
-    expect(
-      done?.type === "done" &&
-        done.message.content.some((block) => block.type === "text" && block.text.includes("partial progress")),
-    ).toBe(false);
-
-    vi.unstubAllGlobals();
-  });
-
-  it("returns length after one retry when text-only truncation persists", async () => {
-    const mockFetch = vi
-      .fn()
-      .mockResolvedValueOnce(makeFetchResponse('{"content":"first partial"}'))
-      .mockResolvedValueOnce(makeFetchResponse('{"content":"second partial"}'));
-    vi.stubGlobal("fetch", mockFetch);
-
-    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
-    const done = events.find((event) => event.type === "done");
-
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    const done = events.find((e) => e.type === "done");
+    expect(done).toBeDefined();
     expect(done?.type === "done" && done.message.stopReason).toBe("length");
-    expect(
-      done?.type === "done" &&
-        done.message.content.some((block) => block.type === "text" && block.text === "second partial"),
-    ).toBe(true);
 
     vi.unstubAllGlobals();
   });
@@ -2284,60 +3347,6 @@ describe("Feature 9: Streaming Integration", () => {
     const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
     expect(toolCalls).toHaveLength(1);
     expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].name).toBe("bash");
-
-    vi.unstubAllGlobals();
-  });
-
-  it("stops a pathological whitespace run before it bloats session history", async () => {
-    const mockFetch = mockFetchOk(`{"content":"Started.${" ".repeat(10_000)}g"}`);
-    vi.stubGlobal("fetch", mockFetch);
-
-    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
-    const deltas = events
-      .filter((event) => event.type === "text_delta")
-      .map((event) => (event as { delta: string }).delta)
-      .join("");
-    const error = events.find((event) => event.type === "error");
-
-    expect(deltas.length).toBeLessThan(5_000);
-    expect(deltas).not.toContain("g");
-    expect(error?.type === "error" && error.error.errorMessage).toContain("runaway whitespace");
-    expect(mockFetch).toHaveBeenCalledOnce();
-
-    vi.unstubAllGlobals();
-  });
-
-  it("tracks runaway whitespace across separate content events", async () => {
-    const mockFetch = mockFetchChunked([
-      `{"content":"Started.${" ".repeat(3_000)}"}`,
-      `{"content":"${" ".repeat(3_000)}g"}`,
-    ]);
-    vi.stubGlobal("fetch", mockFetch);
-
-    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
-    const deltas = events
-      .filter((event) => event.type === "text_delta")
-      .map((event) => (event as { delta: string }).delta)
-      .join("");
-    const error = events.find((event) => event.type === "error");
-
-    expect(deltas.startsWith("Started.")).toBe(true);
-    expect(deltas.length).toBeLessThanOrEqual(4_096 + "Started.".length);
-    expect(deltas).not.toContain("g");
-    expect(error?.type === "error" && error.error.errorMessage).toContain("runaway whitespace");
-
-    vi.unstubAllGlobals();
-  });
-
-  it("does not retry based on text that promises future work", async () => {
-    const response = '{"content":"We should compare both providers next."}{"contextUsagePercentage":10}';
-    const mockFetch = mockFetchOk(response);
-    vi.stubGlobal("fetch", mockFetch);
-
-    const events = await collect(streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" }));
-
-    expect(mockFetch).toHaveBeenCalledOnce();
-    expect(events.find((event) => event.type === "done")).toBeDefined();
 
     vi.unstubAllGlobals();
   });
@@ -2786,61 +3795,31 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
-  describe("rawStopReason from metadataEvent", () => {
-    it("preserves END_TURN verbatim on a text-only turn", async () => {
-      const mockFetch = mockFetchOk('{"content":"Hi"}{"stopReason":"END_TURN"}{"contextUsagePercentage":10}');
-      vi.stubGlobal("fetch", mockFetch);
+  it("aborts the stream when a whitespace run exceeds the bound", async () => {
+    // A whitespace flood resets the idle timer on every frame, so the idle
+    // timeout can never fire. The explicit bound must stop it instead.
+    const flood = JSON.stringify(" ".repeat(5000));
+    vi.stubGlobal("fetch", mockFetchOk(`{"content":"Working"}{"content":${flood}}`));
 
-      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
-      const done = events.find((e) => e.type === "done");
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "test-token" }));
 
-      expect(done?.type === "done" && done.message.rawStopReason).toBe("END_TURN");
-      expect(done?.type === "done" && done.message.stopReason).toBe("stop");
+    const error = events.find((e) => e.type === "error");
+    expect(error).toBeDefined();
+    expect(error?.type === "error" && error.error.errorMessage).toContain("runaway whitespace");
 
-      vi.unstubAllGlobals();
-    });
+    vi.unstubAllGlobals();
+  });
 
-    it("keeps stopReason toolUse when Kiro reports END_TURN alongside a tool call", async () => {
-      // gpt-5.6-* reports END_TURN even when it emits real tool calls, so
-      // emittedToolCalls must still win over the raw value.
-      const mockFetch = mockFetchOk(
-        '{"name":"bash","toolUseId":"t1","input":{"cmd":"ls"}}{"stop":true}{"stopReason":"END_TURN"}{"contextUsagePercentage":10}',
-      );
-      vi.stubGlobal("fetch", mockFetch);
+  it("keeps ordinary whitespace-containing text intact", async () => {
+    vi.stubGlobal("fetch", mockFetchOk('{"content":"line one\\n\\nline two\\n"}{"contextUsagePercentage":5}'));
 
-      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
-      const done = events.find((e) => e.type === "done");
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "test-token" }));
 
-      expect(done?.type === "done" && done.message.rawStopReason).toBe("END_TURN");
-      expect(done?.type === "done" && done.message.stopReason).toBe("toolUse");
+    const done = events.find((e) => e.type === "done");
+    expect(done).toBeDefined();
+    const text = done?.type === "done" ? done.message.content.find((b) => b.type === "text") : undefined;
+    expect(text?.type === "text" && text.text).toBe("line one\n\nline two\n");
 
-      vi.unstubAllGlobals();
-    });
-
-    it("leaves rawStopReason undefined when Kiro sends no metadataEvent", async () => {
-      const mockFetch = mockFetchOk('{"content":"Hi"}{"contextUsagePercentage":10}');
-      vi.stubGlobal("fetch", mockFetch);
-
-      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
-      const done = events.find((e) => e.type === "done");
-
-      expect(done?.type === "done" && done.message.rawStopReason).toBeUndefined();
-      expect(done?.type === "done" && done.message.stopReason).toBe("stop");
-
-      vi.unstubAllGlobals();
-    });
-
-    it("does not treat a metadataEvent as assistant text", async () => {
-      const mockFetch = mockFetchOk('{"content":"Hi"}{"stopReason":"END_TURN"}{"contextUsagePercentage":10}');
-      vi.stubGlobal("fetch", mockFetch);
-
-      const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
-      const done = events.find((e) => e.type === "done");
-      const texts = done?.type === "done" ? done.message.content.filter((c) => c.type === "text") : [];
-
-      expect(texts.map((t) => (t as { text: string }).text).join("")).toBe("Hi");
-
-      vi.unstubAllGlobals();
-    });
+    vi.unstubAllGlobals();
   });
 });

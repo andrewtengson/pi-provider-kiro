@@ -71,14 +71,6 @@ export function injectSyntheticToolCalls(history: KiroHistoryEntry[]): KiroHisto
   return result;
 }
 
-/**
- * Sanitize and normalize outbound history without discarding any entry.
- *
- * Silent truncation used to shift the oldest entries off the front until the
- * payload fit. After Pi compaction that could drop the system/compaction
- * anchor and split tool-call/tool-result pairs, corrupting context in a way
- * neither side could detect. Pi owns lossy compaction; we only normalize.
- */
 export function prepareHistory(history: KiroHistoryEntry[]): KiroHistoryEntry[] {
   return injectSyntheticToolCalls(sanitizeHistory(stripHistoryImages(history)));
 }

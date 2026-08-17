@@ -16,42 +16,61 @@ import { fetchKiroUsage } from "./usage.js";
 
 export { resolveApiRegion } from "./endpoints.js";
 export type { KiroStreamEvent } from "./event-parser.js";
+export {
+  isKiroToolStructureRule,
+  KIRO_TOOL_STRUCTURE_RULES,
+  KIRO_VALIDATION_MESSAGES,
+  type KiroRepairResult,
+  type KiroToolStructureRule,
+  type KiroValidationError,
+  type KiroValidationResult,
+  KiroValidationRule,
+  kiroConversationEntries,
+  repairKiroConversation,
+  SYNTHETIC_FAILED_TOOL_RESULT_TEXT,
+  validateKiroConversation,
+  validateKiroToolStructure,
+} from "./history-validator.js";
 export { KIRO_MODEL_IDS, kiroModels, resolveKiroModel } from "./models.js";
 export { streamKiro } from "./stream.js";
+export {
+  EMPTY_CONTENT_PLACEHOLDER,
+  type KiroHistoryEntry,
+  type KiroToolResult,
+  type KiroToolUse,
+  type KiroUserInputMessage,
+} from "./transform.js";
 
 /**
- * Host-driven catalog refresh.
+ * Host-driven catalog refresh. `oauth.modifyModels` only projects whatever the
+ * cache already holds, so this is the path that actually fetches when the host
+ * asks for a refresh or the cache has gone stale. The composer re-applies
+ * `modifyModels` on top of the returned list, so region/profileArn projection
+ * still happens here.
  *
- * `oauth.modifyModels` only projects whatever the file cache already holds, so
- * this is the path that actually fetches when the host asks for a refresh or
- * the cache has gone stale. Persistence deliberately uses the existing Kiro
- * management file cache (`~/.kiro-management-models-cache.json`) rather than
- * `context.store`, so oauth/stream opportunistic refresh and host refresh all
- * share one catalog source.
- *
- * Fails open: a refresh error leaves the last-known cache in place and returns
- * it, because losing the model list is worse than serving a slightly stale one.
+ * Persistence uses the existing Kiro management file cache
+ * (`updateKiroModelsCache` / `~/.kiro-management-models-cache.json`) rather than
+ * `context.store`, so oauth/stream and host refresh share one catalog source.
  */
 async function refreshKiroModels(context: RefreshModelsContext): Promise<KiroModel[]> {
   const credential = context.credential;
   const oauthCredential = credential?.type === "oauth" ? (credential as unknown as KiroCredentials) : undefined;
-  const cliCredential = oauthCredential ? undefined : getKiroCliCredentials();
-  const accessToken = oauthCredential?.access ?? cliCredential?.access;
-  const region = resolveApiRegion(oauthCredential?.region ?? cliCredential?.region);
+  const accessToken = oauthCredential?.access ?? (credential?.type === "api_key" ? credential.key : undefined);
+  const region = resolveApiRegion(oauthCredential?.region);
 
   if (accessToken && context.allowNetwork && (context.force || isCacheStale(region))) {
     try {
-      await updateKiroModelsCache(accessToken, region, oauthCredential?.profileArn ?? cliCredential?.profileArn);
+      await updateKiroModelsCache(accessToken, region, oauthCredential?.profileArn);
     } catch (error) {
-      console.warn(`[pi-provider-kiro] Host-driven catalog refresh failed in ${region}: ${formatSafeError(error)}`);
+      // Serve the cached catalog when discovery fails.
+      console.warn(`[pi-provider-kiro] Failed to refresh Kiro model catalog in ${region}: ${formatSafeError(error)}`);
     }
   }
 
-  const cached = getCachedModels(region);
-  return cached.length > 0 ? cached : kiroModels;
+  return getCachedModels(region);
 }
 
-export default function (pi: ExtensionAPI): void {
+export default function (pi: ExtensionAPI) {
   // Capture ctx for the custom TUI login component
   pi.on("session_start", async (_event, ctx) => {
     setExtensionContext(ctx);
@@ -59,7 +78,7 @@ export default function (pi: ExtensionAPI): void {
   pi.registerProvider("kiro", {
     baseUrl: getKiroEndpoints("us-east-1").runtime,
     api: "kiro-api",
-    models: getCachedModels("us-east-1"),
+    models: kiroModels,
     refreshModels: refreshKiroModels,
     oauth: {
       // Name reflects all supported auth methods: AWS Builder ID, Google, GitHub

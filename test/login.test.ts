@@ -144,6 +144,36 @@ describe("Feature 10: Interactive Login", () => {
       vi.unstubAllGlobals();
     });
 
+    it("TUI: idc → a failing region probe falls open to the next region", async () => {
+      const { showLoginUI } = await import("../src/login-ui.js");
+      vi.mocked(showLoginUI).mockResolvedValueOnce({ method: "idc", startUrl: "https://mycompany.awsapps.com/start" });
+      // us-east-1 register throws (timeout/DNS); probing must continue to eu-west-1.
+      const mockFetch = vi.fn();
+      mockFetch
+        .mockRejectedValueOnce(new Error("The operation was aborted due to timeout"))
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ clientId: "c2", clientSecret: "s2" }) })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              verificationUri: "u",
+              verificationUriComplete: "u?code=X",
+              userCode: "X",
+              deviceCode: "dc",
+              interval: 1,
+              expiresIn: 10,
+            }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ accessToken: "at", refreshToken: "rt", expiresIn: 3600 }),
+        });
+      vi.stubGlobal("fetch", mockFetch);
+      const creds = await interactiveLogin(makeCallbacks(""));
+      expect((creds as KiroCredentials).region).toBe("eu-west-1");
+      vi.unstubAllGlobals();
+    });
+
     it("TUI: null (cancelled) → falls back to onPrompt", async () => {
       // showLoginUI returns null (default mock), so fallback fires
       vi.stubGlobal("fetch", mockBuilderIdFetch());

@@ -3,12 +3,7 @@
 
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { resolveApiRegion } from "./endpoints.js";
-import {
-  getUsageLimits,
-  type KiroManagementAuth,
-  KiroManagementHttpError,
-  resolveKiroProfileArn,
-} from "./management.js";
+import { getUsageLimits, type KiroManagementAuth, resolveKiroProfileArn } from "./management.js";
 import type { KiroCredentials } from "./oauth.js";
 
 const MANAGE_USAGE_URL = "https://app.kiro.dev/account/usage";
@@ -144,27 +139,13 @@ function mapBucket(bucket: KiroUsageBreakdown, index: number): KiroProviderUsage
 }
 
 async function fetchRawUsage(auth: KiroManagementAuth, profileArn?: string): Promise<KiroGetUsageLimitsResponse> {
-  const request = {
-    profileArn,
-    origin: "KIRO_CLI" as const,
-    resourceType: "CREDIT" as const,
-    isEmailRequired: false as const,
-  };
-
-  try {
-    return await getUsageLimits<KiroGetUsageLimitsResponse>(auth, request);
-  } catch (error) {
-    // Profile-less usage is rejected with 403 for some tokens and with 400
-    // ("Invalid profileArn.") for accounts that require a profile. In both
-    // cases the only recoverable input is the profile, so resolve one and
-    // retry exactly once.
-    if (profileArn || !(error instanceof KiroManagementHttpError) || (error.status !== 403 && error.status !== 400)) {
-      throw error;
-    }
-  }
-
-  const resolvedProfileArn = await resolveKiroProfileArn(auth);
-  return getUsageLimits<KiroGetUsageLimitsResponse>(auth, { ...request, profileArn: resolvedProfileArn });
+  const resolvedProfileArn = await resolveKiroProfileArn(auth, profileArn);
+  return getUsageLimits<KiroGetUsageLimitsResponse>(auth, {
+    profileArn: resolvedProfileArn,
+    origin: "KIRO_CLI",
+    resourceType: "CREDIT",
+    isEmailRequired: false,
+  });
 }
 
 export async function fetchKiroUsage(credentials: OAuthCredentials): Promise<KiroProviderUsage> {

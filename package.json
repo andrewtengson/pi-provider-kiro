@@ -1,6 +1,6 @@
 {
   "name": "pi-provider-kiro",
-  "version": "0.8.1",
+  "version": "0.10.0",
   "description": "pi extension for the Kiro API (AWS CodeWhisperer/Q) — 12 kiro-cli-verified models with OAuth authentication",
   "type": "module",
   "license": "MIT",
@@ -44,9 +44,9 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.2",
-    "@earendil-works/pi-ai": "^0.83.0",
-    "@earendil-works/pi-coding-agent": "^0.83.0",
-    "@earendil-works/pi-tui": "^0.83.0",
+    "@earendil-works/pi-ai": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   }

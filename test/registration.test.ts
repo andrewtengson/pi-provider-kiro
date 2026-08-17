@@ -1,12 +1,21 @@
+import { rmSync } from "node:fs";
+import type { ProviderModelsStore } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getKiroCliCredentials } from "../src/kiro-cli.js";
-import { getCachedModels, kiroModels } from "../src/models.js";
+import { KIRO_MANAGEMENT_CACHE_PATH, kiroModels } from "../src/models.js";
 
 const mockPi = () => {
   const registerProvider = vi.fn();
   return { pi: { registerProvider, on: vi.fn() } as unknown as ExtensionAPI, registerProvider };
 };
+
+/** Minimal host store fixture — refreshKiroModels intentionally uses the Kiro file cache instead. */
+const mockProviderModelsStore = (): ProviderModelsStore => ({
+  read: vi.fn(async () => undefined),
+  write: vi.fn(async () => {}),
+  delete: vi.fn(async () => {}),
+});
 
 describe("Feature 1: Extension Registration", () => {
   it("exports a default function", async () => {
@@ -24,16 +33,16 @@ describe("Feature 1: Extension Registration", () => {
     expect(registerProvider.mock.calls[0][0]).toBe("kiro");
   });
 
-  it("registers the startup model cache", async () => {
+  it("registers 18 models", async () => {
     const mod = await import("../src/index.js");
     const { pi, registerProvider } = mockPi();
     mod.default(pi);
 
     const config = registerProvider.mock.calls[0][1];
-    expect(config.models).toEqual(getCachedModels("us-east-1"));
+    expect(config.models).toHaveLength(18);
   });
 
-  it("registers OAuth with name 'Kiro (Builder ID / Google / GitHub)'", async () => {
+  it("preserves the existing OAuth and kiro-cli credential contract", async () => {
     const mod = await import("../src/index.js");
     const { pi, registerProvider } = mockPi();
     mod.default(pi);
@@ -62,6 +71,80 @@ describe("Feature 1: Extension Registration", () => {
     mod.default(pi);
 
     expect(registerProvider.mock.calls[0][1].api).toBe("kiro-api");
+  });
+
+  describe("refreshModels", () => {
+    beforeEach(() => {
+      rmSync(KIRO_MANAGEMENT_CACHE_PATH, { force: true });
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      rmSync(KIRO_MANAGEMENT_CACHE_PATH, { force: true });
+    });
+
+    const refreshModels = async () => {
+      const mod = await import("../src/index.js");
+      const { pi, registerProvider } = mockPi();
+      mod.default(pi);
+      return registerProvider.mock.calls[0][1].refreshModels;
+    };
+
+    it("serves the bootstrap catalog without a credential and never hits the network", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+
+      const models = await (await refreshModels())({
+        allowNetwork: true,
+        force: true,
+        store: mockProviderModelsStore(),
+      });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(models).toEqual(kiroModels);
+    });
+
+    it("fetches the regional catalog when forced with an OAuth credential", async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ models: [{ modelId: "claude-opus-4.8" }, { modelId: "openai-gpt-5.6" }] }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const models = await (await refreshModels())({
+        allowNetwork: true,
+        force: true,
+        store: mockProviderModelsStore(),
+        credential: {
+          type: "oauth",
+          access: "refresh-access",
+          refresh: "r",
+          expires: 0,
+          region: "eu-west-1",
+          profileArn: "arn:aws:codewhisperer:eu-central-1:123456789012:profile/test",
+        },
+      });
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(String(fetchMock.mock.calls[0][0])).toContain("https://management.eu-central-1.kiro.dev/");
+      expect(models.map((model: { id: string }) => model.id)).toEqual(["claude-opus-4-8", "openai-gpt-5-6"]);
+    });
+
+    it("falls back to the cached catalog when discovery fails", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
+
+      const models = await (await refreshModels())({
+        allowNetwork: true,
+        force: true,
+        store: mockProviderModelsStore(),
+        credential: { type: "oauth", access: "a", refresh: "r", expires: 0, region: "us-east-1", profileArn: "arn:p" },
+      });
+
+      expect(models).toEqual(kiroModels);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("Failed to refresh Kiro model catalog"));
+      warn.mockRestore();
+    });
   });
 
   it.each([
@@ -155,106 +238,33 @@ describe("Feature 1: Extension Registration", () => {
     );
   });
 
-  describe("refreshModels (host-driven catalog refresh)", () => {
-    const oauthCredential = (region = "us-east-1") => ({
-      type: "oauth" as const,
-      access: "tok",
-      refresh: "r",
-      expires: Date.now() + 60_000,
-      clientId: "",
-      clientSecret: "",
-      region,
-      profileArn: "arn:aws:codewhisperer:us-east-1:123:profile/P",
-    });
-
-    it("is wired so the host can drive a refresh", async () => {
-      const mod = await import("../src/index.js");
-      const { pi, registerProvider } = mockPi();
-      mod.default(pi);
-      expect(typeof registerProvider.mock.calls[0][1].refreshModels).toBe("function");
-    });
-
-    it("fetches the management catalog when the host forces a refresh", async () => {
-      vi.resetModules();
-      const updateKiroModelsCache = vi.fn().mockResolvedValue(undefined);
-      vi.doMock("../src/models.js", async () => {
-        const actual = await vi.importActual<typeof import("../src/models.js")>("../src/models.js");
-        return { ...actual, updateKiroModelsCache, isCacheStale: vi.fn().mockReturnValue(false) };
-      });
-      const mod = await import("../src/index.js");
-      const { pi, registerProvider } = mockPi();
-      mod.default(pi);
-
-      const models = await registerProvider.mock.calls[0][1].refreshModels({
-        credential: oauthCredential(),
-        allowNetwork: true,
-        force: true,
-        store: {} as never,
-      });
-
-      expect(updateKiroModelsCache).toHaveBeenCalledOnce();
-      expect(Array.isArray(models)).toBe(true);
-      vi.doUnmock("../src/models.js");
-    });
-
-    it("never fetches when the host disallows network access", async () => {
-      vi.resetModules();
-      const updateKiroModelsCache = vi.fn().mockResolvedValue(undefined);
-      vi.doMock("../src/models.js", async () => {
-        const actual = await vi.importActual<typeof import("../src/models.js")>("../src/models.js");
-        return { ...actual, updateKiroModelsCache, isCacheStale: vi.fn().mockReturnValue(true) };
-      });
-      const mod = await import("../src/index.js");
-      const { pi, registerProvider } = mockPi();
-      mod.default(pi);
-
-      const models = await registerProvider.mock.calls[0][1].refreshModels({
-        credential: oauthCredential(),
-        allowNetwork: false,
-        store: {} as never,
-      });
-
-      expect(updateKiroModelsCache).not.toHaveBeenCalled();
-      expect(Array.isArray(models)).toBe(true);
-      vi.doUnmock("../src/models.js");
-    });
-
-    it("returns the cached catalog without throwing when the fetch fails", async () => {
-      vi.resetModules();
-      vi.doMock("../src/models.js", async () => {
-        const actual = await vi.importActual<typeof import("../src/models.js")>("../src/models.js");
-        return {
-          ...actual,
-          updateKiroModelsCache: vi.fn().mockRejectedValue(new Error("catalog down")),
-          isCacheStale: vi.fn().mockReturnValue(true),
-        };
-      });
-      const mod = await import("../src/index.js");
-      const { pi, registerProvider } = mockPi();
-      mod.default(pi);
-
-      await expect(
-        registerProvider.mock.calls[0][1].refreshModels({
-          credential: oauthCredential(),
-          allowNetwork: true,
-          force: true,
-          store: {} as never,
-        }),
-      ).resolves.toBeInstanceOf(Array);
-      vi.doUnmock("../src/models.js");
-    });
-
-    it("returns the static baseline when no OAuth credential is configured", async () => {
-      const mod = await import("../src/index.js");
-      const { pi, registerProvider } = mockPi();
-      mod.default(pi);
-
-      const models = await registerProvider.mock.calls[0][1].refreshModels({
-        allowNetwork: true,
-        force: true,
-        store: {} as never,
-      });
-      expect(Array.isArray(models)).toBe(true);
-    });
+  // Extension **entry module** surface — not an npm package entry point.
+  //
+  // `pi.extensions: ["./dist/index.js"]` tells the pi host which module to load.
+  // It is not a bare-specifier entry: `package.json` declares no `main`,
+  // `exports`, or `types`, and the build emits no declarations, so
+  // `import { validateKiroConversation } from "pi-provider-kiro"` does not
+  // resolve from the published tarball (verified 2026-08-11 by packing and
+  // importing in an isolated consumer: `ERR_MODULE_NOT_FOUND`). This pins that
+  // the symbols leave this module; giving them a resolvable package entry is a
+  // packaging change owned separately.
+  it("re-exports the history validator surface from the entry module", async () => {
+    const mod = await import("../src/index.js");
+    for (const name of [
+      "validateKiroConversation",
+      "validateKiroToolStructure",
+      "repairKiroConversation",
+      "kiroConversationEntries",
+      "isKiroToolStructureRule",
+    ] as const) {
+      expect(typeof mod[name], name).toBe("function");
+    }
+    expect(mod.KiroValidationRule.NON_EMPTY_USER_MESSAGE).toBe("NON_EMPTY_USER_MESSAGE");
+    expect(mod.KIRO_TOOL_STRUCTURE_RULES).toHaveLength(3);
+    expect(mod.KIRO_VALIDATION_MESSAGES.NON_EMPTY_USER_MESSAGE).toBe(
+      "User messages must have either content or tool results",
+    );
+    expect(mod.SYNTHETIC_FAILED_TOOL_RESULT_TEXT).toBe("Tool use was interrupted and did not produce a result.");
+    expect(mod.EMPTY_CONTENT_PLACEHOLDER).toBe("Please proceed with the task.");
   });
 });

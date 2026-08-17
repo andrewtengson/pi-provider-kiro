@@ -13,6 +13,7 @@ import type {
   Model,
   SimpleStreamOptions,
   TextContent,
+  ThinkingContent,
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
@@ -35,10 +36,12 @@ import {
   HISTORY_LIMIT_CONTEXT_WINDOW,
   prepareHistory,
 } from "./history.js";
+import { isKiroToolStructureRule, kiroConversationEntries, repairKiroConversation } from "./history-validator.js";
 import { getKiroCliCredentials, getKiroCliCredentialsAllowExpired, refreshViaKiroCli } from "./kiro-cli.js";
 import {
   invalidateKiroProfileArn,
   type KiroManagementAuth,
+  KiroManagementHttpError,
   resetKiroProfileArnCache,
   resolveKiroProfileArn,
 } from "./management.js";
@@ -58,15 +61,16 @@ import {
   buildHistory,
   convertImagesToKiro,
   convertToolsToKiro,
+  EMPTY_CONTENT_PLACEHOLDER,
   extractImages,
   getContentText,
   type KiroHistoryEntry,
   type KiroImage,
-  type KiroReasoningContent,
   type KiroToolResult,
   type KiroToolSpec,
   type KiroUserInputMessage,
   normalizeMessages,
+  relocateDisplacedToolResults,
   sanitizeSurrogates,
   TOOL_RESULT_LIMIT,
   truncate,
@@ -75,6 +79,7 @@ import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js
 
 const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
+/** Upper bound on a single whitespace run before the stream is treated as runaway. */
 const MAX_CONSECUTIVE_WHITESPACE = 4096;
 
 const eventStreamMarshaller = new UniversalEventStreamMarshaller({
@@ -123,8 +128,8 @@ interface KiroRequest {
     currentMessage: { userInputMessage: KiroUserInputMessage };
     history?: KiroHistoryEntry[];
   };
-  profileArn: string;
   additionalModelRequestFields?: KiroAdditionalModelRequestFields;
+  profileArn: string;
   agentMode?: string;
 }
 interface KiroToolCallState {
@@ -214,7 +219,7 @@ export function streamKiro(
         additionalModelRequestFieldsSchema?: Record<string, unknown>;
       };
       const region = modelMetadata.kiroRegion ?? getKiroRegionFromEndpoint(model.baseUrl) ?? "us-east-1";
-      const endpoint = getKiroEndpoints(region).runtime;
+      const endpoint = new URL("generateAssistantResponse", getKiroEndpoints(region).runtime).toString();
       let managementAuth: KiroManagementAuth = { accessToken, region };
 
       const optionProfileArn =
@@ -223,9 +228,29 @@ export function streamKiro(
       const cliCreds = getKiroCliCredentials() ?? getKiroCliCredentialsAllowExpired();
       const cliProfileArn = cliCreds?.access === accessToken ? cliCreds.profileArn : undefined;
       const initialProfileArn = modelMetadata.kiroProfileArn || optionProfileArn || cliProfileArn;
-      let profileArn: string =
-        initialProfileArn ||
-        (skipProfileResolutionForTests ? TEST_PROFILE_ARN : await resolveKiroProfileArn(managementAuth));
+      let profileArn: string;
+      try {
+        profileArn =
+          initialProfileArn ||
+          (skipProfileResolutionForTests ? TEST_PROFILE_ARN : await resolveKiroProfileArn(managementAuth));
+      } catch (error) {
+        if (!(error instanceof KiroManagementHttpError) || error.status !== 403) throw error;
+
+        // The host may have captured an access token before kiro-cli rotated it.
+        // Re-read the shared store first, then force a refresh only when it still
+        // contains the rejected token. Profile discovery must succeed before the
+        // runtime request can be constructed.
+        const storedCreds = getKiroCliCredentials();
+        const freshCreds =
+          storedCreds?.access && storedCreds.access !== accessToken ? storedCreds : refreshViaKiroCli();
+        if (!freshCreds?.access) throw error;
+
+        accessToken = freshCreds.access;
+        managementAuth = { accessToken, region };
+        profileArn =
+          freshCreds.profileArn ||
+          (skipProfileResolutionForTests ? TEST_PROFILE_ARN : await resolveKiroProfileArn(managementAuth));
+      }
 
       // Trigger dynamic models cache update in the background if empty or stale
       const { isCacheStale, updateKiroModelsCache } = await import("./models.js");
@@ -238,7 +263,7 @@ export function streamKiro(
       }
 
       const kiroModelId = resolveKiroModel(model.id, modelMetadata.kiroModelId);
-      const effortConfig = getKiroEffortConfig(modelMetadata, kiroModelId);
+      const effortConfig = getKiroEffortConfig(modelMetadata.additionalModelRequestFieldsSchema, kiroModelId);
       const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(
         modelMetadata,
         kiroModelId,
@@ -259,38 +284,42 @@ export function streamKiro(
         sessionId: options?.sessionId,
       });
       let systemPrompt = context.systemPrompt ?? "";
-      if (thinkingEnabled && !effortConfig) {
+      // Kiro's runtime endpoint honors structured effort but only exposes Claude's
+      // user-visible thinking stream when the legacy thinking markers are also
+      // present. Keep both controls: structured fields select effort, while these
+      // markers preserve the <thinking> content consumed by ThinkingTagParser.
+      if (thinkingEnabled && effortConfig?.field !== "reasoning") {
         const budget =
-          options?.reasoning === "max"
-            ? 70000
-            : options?.reasoning === "xhigh"
-              ? 50000
-              : options?.reasoning === "high"
-                ? 30000
-                : options?.reasoning === "medium"
-                  ? 20000
-                  : 10000;
+          options?.reasoning === "xhigh"
+            ? 50000
+            : options?.reasoning === "high"
+              ? 30000
+              : options?.reasoning === "medium"
+                ? 20000
+                : 10000;
         systemPrompt = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>${systemPrompt ? `\n${systemPrompt}` : ""}`;
       }
-      const baseTools = context.tools?.length ? convertToolsToKiro(context.tools) : [];
       let retryCount = 0;
-      let truncatedTextRetryAttempted = false;
       const maxRetries = 3;
       const conversationId = options?.sessionId ?? crypto.randomUUID();
       while (retryCount <= maxRetries) {
         if (options?.signal?.aborted) throw options.signal.reason;
         const effectiveSystemPrompt = systemPrompt;
-        const normalized = normalizeMessages(context.messages);
+        // Relocate a tool result that arrived behind a later assistant turn than
+        // the one that called it, before anything positional runs. Interleaved
+        // concurrent tool executions produce that shape, and `sanitizeHistory`
+        // pairs POSITIONALLY, so without this pass the displaced result's issuing
+        // assistant is dropped and the real tool output is discarded. Pure
+        // reorder — see `relocateDisplacedToolResults`.
+        const normalized = relocateDisplacedToolResults(normalizeMessages(context.messages));
         const {
           history: rawHistory,
           systemPrepended,
           currentMsgStartIdx,
         } = buildHistory(normalized, kiroModelId, effectiveSystemPrompt);
-        // Scale the history budget to the model context window.
-        // HISTORY_LIMIT (850K chars) is sized for 200K token models.
         // Preserve semantic context locally; Pi owns lossy compaction.
-        const dynamicHistoryLimit = Math.floor((model.contextWindow / HISTORY_LIMIT_CONTEXT_WINDOW) * HISTORY_LIMIT);
         const history = prepareHistory(rawHistory);
+        const dynamicHistoryLimit = Math.floor((model.contextWindow / HISTORY_LIMIT_CONTEXT_WINDOW) * HISTORY_LIMIT);
         const toolResultLimit = TOOL_RESULT_LIMIT;
         const currentMessages = normalized.slice(currentMsgStartIdx);
         const firstMsg = currentMessages[0];
@@ -300,21 +329,22 @@ export function streamKiro(
         if (firstMsg?.role === "assistant") {
           const am = firstMsg as AssistantMessage;
           let armContent = "";
-          let armReasoningContent: KiroReasoningContent | undefined;
           const armToolUses: Array<{ name: string; toolUseId: string; input: Record<string, unknown> }> = [];
           if (Array.isArray(am.content))
             for (const b of am.content) {
               if (b.type === "text") armContent += (b as TextContent).text;
-              else if (b.type === "thinking") {
-                const thinkingBlock = b as unknown as { thinking: string; thinkingSignature?: string };
-                if (thinkingBlock.thinkingSignature) {
-                  armReasoningContent = {
-                    reasoningText: { text: thinkingBlock.thinking, signature: thinkingBlock.thinkingSignature },
-                  };
-                } else {
-                  armContent = `<thinking>${thinkingBlock.thinking}</thinking>\n\n${armContent}`;
-                }
-              } else if (b.type === "toolCall") {
+              // Reasoning is deliberately NOT serialized into the assistant text
+              // channel, matching `buildHistory` and first-party
+              // `extractTextContent`, which type-filters to `text`. Flattening it
+              // to `<thinking>...</thinking>` writes literal markup into the
+              // string the model reads back as its own prior speech.
+              //
+              // Unlike the history site, this needs no "turn had blocks" guard:
+              // `currentMsgStartIdx` increments past an assistant that declares no
+              // `toolCall`, so reaching this branch at all means one exists and
+              // `armToolUses` is non-empty. The guard below therefore cannot drop
+              // the entry when reasoning is excluded.
+              else if (b.type === "toolCall") {
                 const tc = b as ToolCall;
                 armToolUses.push({
                   name: tc.name,
@@ -326,18 +356,22 @@ export function streamKiro(
                 });
               }
             }
-          if (armContent || armReasoningContent || armToolUses.length > 0) {
+          if (armContent || armToolUses.length > 0) {
             const lastEntryForArm = history[history.length - 1];
             const prevArm = lastEntryForArm?.assistantResponseMessage;
             if (history.length > 0 && !lastEntryForArm?.userInputMessage && prevArm) {
-              // Merge into previous assistant message to maintain alternation without synthetic padding
-              prevArm.content += `\n\n${armContent}`;
+              // Merge into previous assistant message to maintain alternation
+              // without synthetic padding. Join only non-empty sides: a turn that
+              // carried only reasoning or only a tool call leaves `armContent`
+              // empty, and an unconditional separator would append a bare `\n\n`
+              // onto text the model actually produced.
+              prevArm.content =
+                prevArm.content && armContent ? `${prevArm.content}\n\n${armContent}` : prevArm.content || armContent;
               if (armToolUses.length > 0) prevArm.toolUses = [...(prevArm.toolUses || []), ...armToolUses];
             } else {
               history.push({
                 assistantResponseMessage: {
                   content: armContent,
-                  ...(armReasoningContent ? { reasoningContent: armReasoningContent } : {}),
                   ...(armToolUses.length > 0 ? { toolUses: armToolUses } : {}),
                 },
               });
@@ -361,7 +395,10 @@ export function streamKiro(
             const converted = convertImagesToKiro(toolResultImages);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
-          currentContent = currentToolResults.length > 0 ? "Tool results provided." : "Please proceed with the task.";
+          // A tool turn carries its payload in `userInputMessageContext.toolResults`,
+          // so it needs no text. Leaving this empty also leaves the fallback
+          // below free to fill in only genuinely payload-less turns.
+          currentContent = "";
         } else if (firstMsg?.role === "toolResult") {
           const toolResultImages2: ImageContent[] = [];
           for (const m of currentMessages)
@@ -379,20 +416,19 @@ export function streamKiro(
             const converted = convertImagesToKiro(toolResultImages2);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
-          currentContent = "Tool results provided.";
+          // Empty by design — `toolResults` is this turn's payload.
+          currentContent = "";
         } else if (firstMsg?.role === "user") {
           currentContent = typeof firstMsg.content === "string" ? firstMsg.content : getContentText(firstMsg);
           if (effectiveSystemPrompt && !systemPrepended)
             currentContent = `${effectiveSystemPrompt}\n\n${currentContent}`;
         }
         // Current assistant tool calls are outbound history too, so enforce the
-        // budget only after they have been appended. Throwing surfaces
-        // context_length_exceeded so Pi can compact and retry instead of us
-        // silently dropping the compaction anchor or splitting tool pairs.
+        // budget only after they have been appended.
         assertHistoryWithinLimit(history, dynamicHistoryLimit);
         // Prepend truncation notice if the previous assistant response was cut off
         if (wasPreviousResponseTruncated(context.messages)) {
-          currentContent = `${TRUNCATION_NOTICE}\n\n${currentContent}`;
+          currentContent = currentContent === "" ? TRUNCATION_NOTICE : `${TRUNCATION_NOTICE}\n\n${currentContent}`;
         }
         // Always synthesize placeholder specs for tool names referenced in
         // history, even when context.tools is empty/undefined. Without this,
@@ -400,6 +436,7 @@ export function streamKiro(
         // declares no current tools is rejected by Kiro as "Improperly formed
         // request" because history references toolUses with no tool catalog.
         let uimc: { toolResults?: KiroToolResult[]; tools?: KiroToolSpec[] } | undefined;
+        const baseTools = context.tools?.length ? convertToolsToKiro(context.tools) : [];
         const finalTools = history.length > 0 ? addPlaceholderTools(baseTools, history) : baseTools;
         if (currentToolResults.length > 0 || finalTools.length > 0) {
           uimc = {};
@@ -410,8 +447,98 @@ export function streamKiro(
           const imgs = extractImages(firstMsg);
           if (imgs.length > 0) currentImages = convertImagesToKiro(imgs as ImageContent[]);
         }
+        // A turn with neither text nor tool results has no payload at all:
+        // an image-only user message, an empty-text user message, or a
+        // host-appended message whose role falls outside pi-ai's `Message`
+        // union. Send a neutral prompt so its attachments still reach the
+        // model (#106).
+        //
+        // The `currentToolResults` guard is load-bearing. Without it this line
+        // refills every tool turn that deliberately left `currentContent`
+        // empty, and the only change is which sentence is fabricated. Kiro's
+        // rule is content **or** tool results — see EMPTY_CONTENT_PLACEHOLDER.
+        if (currentContent === "" && currentToolResults.length === 0) currentContent = EMPTY_CONTENT_PLACEHOLDER;
         // kiro-cli does not enforce alternation — the API accepts
         // non-alternating history. No synthetic padding needed.
+        //
+        // Pre-send REPAIR against the seven rules first-party Kiro Agent
+        // enforces. `prepareHistory` covers the shapes this provider itself
+        // produces, but not every shape a caller can hand us: `sanitizeHistory`
+        // tests tool pairing by POSITION, so an assistant entry with `toolUses`
+        // survives whenever the next entry carries any `toolResults` at all,
+        // matching ids or not, and `injectSyntheticToolCalls` only rescues
+        // orphaned RESULTS. A mismatched pair — both partners present, paired
+        // with each other's counterpart — passes both passes untouched and is
+        // rejected on the wire with `400 TOOL_USE_RESULT_MISMATCH`.
+        //
+        // Observed 2026-08-14: a caller whose transcript interleaved two
+        // concurrent tool executions sent exactly that shape, and because the
+        // retry resends identical history the session was terminally wedged.
+        //
+        // Repair runs on the WHOLE conversation and is split back afterwards.
+        // Repairing `history` alone would be wrong in the ordinary case: its
+        // last entry is normally the assistant whose `toolUses` this very
+        // request answers, so rule 4 would synthesize a FAILED result for a call
+        // whose real output is sitting in the current message.
+        //
+        // Still never throws. `remaining` is what repair could not express, and
+        // that — not merely "input was invalid" — is what earns the warning.
+        const conversationEntries = kiroConversationEntries(history, {
+          content: currentContent,
+          modelId: kiroModelId,
+          origin: "KIRO_CLI",
+          ...(uimc ? { userInputMessageContext: uimc } : {}),
+        });
+        const repair = repairKiroConversation(conversationEntries);
+        if (repair.diagnostics.length > 0) {
+          debugLog("request.invariants", { errors: repair.diagnostics, remaining: repair.remaining });
+        }
+        // Split back. Repair moves entries in only three ways, and each one keeps
+        // the current message last:
+        //   - step 1 drops a prefix, never a suffix;
+        //   - step 4 inserts a synthetic user turn only AFTER an assistant whose
+        //     uses nothing answers, and the current message is a user entry, so
+        //     no assistant is ever last;
+        //   - steps 2/3/5 rewrite entries in place.
+        // The one exception is total collapse: a conversation that is *only* a
+        // bare tool-result carrier has no valid opening entry, so step 1 consumes
+        // it and returns nothing. Because step 1 cannot skip past a survivor,
+        // `entries.length === 0` is the only shape where the current message is
+        // gone — anything longer keeps it at the end.
+        const repairedCurrent = repair.entries[repair.entries.length - 1]?.userInputMessage;
+        // `currentImages` is carried separately below and is not part of the
+        // repaired projection, so only text + context are read back here.
+        //
+        // Read the repaired context EXACTLY, including when repair removed it.
+        // A `?? uimc` fallback here would undo the repair in the one case that
+        // matters most: stripping every orphaned tool result leaves a turn with
+        // no context at all, and falling back would put the orphans — the shape
+        // the backend rejects — straight back onto the wire.
+        let wireHistory: KiroHistoryEntry[];
+        let wireContent: string;
+        let wireUimc: typeof uimc;
+        if (repairedCurrent) {
+          wireHistory = repair.entries.slice(0, -1);
+          wireContent = repairedCurrent.content;
+          wireUimc = repairedCurrent.userInputMessageContext;
+        } else {
+          // Collapsed. Apply what repair would have applied to a lone carrier:
+          // drop the results that answer nothing (steps 3), keep any tool
+          // catalog, and give the empty turn the neutral prompt (step 5).
+          wireHistory = [];
+          wireContent = currentContent || EMPTY_CONTENT_PLACEHOLDER;
+          wireUimc = uimc?.tools?.length ? { tools: uimc.tools } : undefined;
+        }
+        if (repair.remaining.length > 0) {
+          const structural = repair.remaining.filter((e) => isKiroToolStructureRule(e.rule));
+          if (structural.length > 0) {
+            console.warn(
+              `[pi-provider-kiro] outbound history still violates ${structural
+                .map((e) => `${e.rule}@${e.index}`)
+                .join(", ")} after repair — Kiro may reject this request`,
+            );
+          }
+        }
         const request: KiroRequest = {
           conversationState: {
             chatTriggerType: "MANUAL",
@@ -419,14 +546,14 @@ export function streamKiro(
             conversationId,
             currentMessage: {
               userInputMessage: {
-                content: sanitizeSurrogates(currentContent),
+                content: sanitizeSurrogates(wireContent),
                 modelId: kiroModelId,
                 origin: "KIRO_CLI",
                 ...(currentImages ? { images: currentImages } : {}),
-                ...(uimc ? { userInputMessageContext: uimc } : {}),
+                ...(wireUimc ? { userInputMessageContext: wireUimc } : {}),
               },
             },
-            ...(history.length > 0 ? { history } : {}),
+            ...(wireHistory.length > 0 ? { history: wireHistory } : {}),
           },
           ...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
           profileArn,
@@ -442,19 +569,22 @@ export function streamKiro(
           debugLog("request.send", {
             attempt: retryCount,
             capacityAttempt: capacityRetryCount,
-            historyLen: history.length,
-            currentContentLen: currentContent.length,
+            // Wire values, not pre-repair ones: this line is what a reader
+            // correlates against a 400, so it must describe the bytes actually
+            // sent. `toolResultCount` likewise counts the repaired carrier,
+            // which may include synthesized results the raw turn never had.
+            historyLen: wireHistory.length,
+            currentContentLen: wireContent.length,
             hasImages: !!currentImages,
-            toolResultCount: currentToolResults.length,
+            toolResultCount: wireUimc?.toolResults?.length ?? 0,
             request,
           });
           response = await fetch(endpoint, {
             method: "POST",
             headers: {
-              "Content-Type": "application/x-amz-json-1.0",
-              Accept: "application/json",
+              "Content-Type": "application/json",
+              Accept: "application/vnd.amazon.eventstream",
               Authorization: `Bearer ${accessToken}`,
-              "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
               "x-amzn-codewhisperer-optout": "true",
               "amz-sdk-invocation-id": crypto.randomUUID(),
               "amz-sdk-request": "attempt=1; max=1",
@@ -551,30 +681,35 @@ export function streamKiro(
         let lastContentData = "";
         let consecutiveWhitespace = 0;
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
-        let rawStopReason: string | undefined;
         let receivedContextUsage = false;
-        // Debug-only: ordered trace of raw frame keys and parsed event types to
-        // diagnose premature stops (e.g. tool preamble text with no toolUse frame).
+        let rawStopReason: string | undefined;
+        // Debug-only: ordered trace of raw frame keys and parsed event types, used
+        // to diagnose premature stops (tool preamble text with no toolUse frame).
         const frameTrace: string[] = [];
         const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
-        let nativeReasoningActive = false;
-        let nativeReasoningSignature: string | undefined;
-        const finishNativeReasoning = () => {
-          const contentIndex = thinkingParser?.getThinkingBlockIndex();
-          if (!nativeReasoningActive || contentIndex === null || contentIndex === undefined) return;
-          const thinkingBlock = output.content[contentIndex] as unknown as {
-            thinking: string;
-            thinkingSignature?: string;
+        let nativeThinkingBlockIndex: number | null = null;
+        let nativeThinkingEnded = false;
+        const ensureNativeThinkingBlock = (): { block: ThinkingContent; contentIndex: number } => {
+          if (nativeThinkingBlockIndex === null) {
+            nativeThinkingBlockIndex = output.content.length;
+            output.content.push({ type: "thinking", thinking: "" });
+            stream.push({ type: "thinking_start", contentIndex: nativeThinkingBlockIndex, partial: output });
+          }
+          return {
+            block: output.content[nativeThinkingBlockIndex] as ThinkingContent,
+            contentIndex: nativeThinkingBlockIndex,
           };
-          if (nativeReasoningSignature) thinkingBlock.thinkingSignature = nativeReasoningSignature;
+        };
+        const endNativeThinking = () => {
+          if (nativeThinkingBlockIndex === null || nativeThinkingEnded) return;
+          nativeThinkingEnded = true;
+          const block = output.content[nativeThinkingBlockIndex] as ThinkingContent;
           stream.push({
             type: "thinking_end",
-            contentIndex,
-            content: thinkingBlock.thinking,
+            contentIndex: nativeThinkingBlockIndex,
+            content: block.thinking,
             partial: output,
           });
-          nativeReasoningActive = false;
-          nativeReasoningSignature = undefined;
         };
         let textBlockIndex: number | null = null;
         let emittedToolCalls = 0;
@@ -618,7 +753,7 @@ export function streamKiro(
         const utf8Decoder = new TextDecoder();
         const eventStream = eventStreamMarshaller.deserialize(bodyIterable, async (event: Record<string, Message>) => {
           const entry = Object.entries(event)[0];
-          if (!entry) throw new Error("Kiro stream event had no payload");
+          if (!entry) throw new Error("Received an empty event stream message");
           const [key, msg] = entry;
           const parsed = JSON.parse(utf8Decoder.decode(msg.body)) as Record<string, unknown>;
           return { [key]: parsed } as Record<string, unknown>;
@@ -630,6 +765,8 @@ export function streamKiro(
           try {
             if (!gotFirstToken) {
               const readPromise = iterator.next();
+              // Clear the timer on every exit path. A leaked first-token timeout
+              // keeps the event loop alive and stalls non-interactive pi runs.
               let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
               const timeoutPromise = new Promise<typeof FIRST_TOKEN_SENTINEL>((resolve) => {
                 firstTokenTimer = setTimeout(() => resolve(FIRST_TOKEN_SENTINEL), firstTokenTimeoutForModel(model.id));
@@ -669,11 +806,7 @@ export function streamKiro(
           if (!event) {
             if (debugEnabled()) {
               frameTrace.push(`${rawFrameKey}:UNPARSED`);
-              debugLog("stream.unparsed_frame", {
-                key: rawFrameKey,
-                payloadKeys: Object.keys(eventPayload),
-                stopReason: typeof eventPayload.stopReason === "string" ? eventPayload.stopReason : undefined,
-              });
+              debugLog("stream.unparsed_frame", { key: rawFrameKey, payloadKeys: Object.keys(eventPayload) });
             }
             continue;
           }
@@ -682,6 +815,13 @@ export function streamKiro(
             debugLog("stream.events", [event]);
           }
           switch (event.type) {
+            // Kiro's authoritative terminal marker. Recorded for diagnosis only —
+            // it must not drive stopReason, because gpt-5.6-* reports END_TURN
+            // even on turns that emit real tool calls.
+            case "metadata": {
+              rawStopReason = event.data.stopReason;
+              break;
+            }
             case "contextUsage": {
               const pct = event.data.contextUsagePercentage;
               output.usage.input = Math.round((pct / 100) * model.contextWindow);
@@ -689,20 +829,33 @@ export function streamKiro(
               receivedContextUsage = true;
               break;
             }
-            case "reasoning": {
-              nativeReasoningActive = true;
-              if (event.data.text) {
-                thinkingParser?.emitNativeThinking(event.data.text);
-                totalContent += event.data.text;
-              }
-              if (event.data.signature) nativeReasoningSignature = event.data.signature;
+            case "thinkingText": {
+              if (!thinkingEnabled) break;
+              const { block, contentIndex } = ensureNativeThinkingBlock();
+              block.thinking += event.data;
+              totalContent += event.data;
+              stream.push({
+                type: "thinking_delta",
+                contentIndex,
+                delta: event.data,
+                partial: output,
+              });
+              break;
+            }
+            case "thinkingSignature": {
+              if (!thinkingEnabled) break;
+              const { block } = ensureNativeThinkingBlock();
+              block.thinkingSignature = event.data;
+              endNativeThinking();
               break;
             }
             case "content": {
-              finishNativeReasoning();
+              endNativeThinking();
               if (event.data === lastContentData) continue;
               lastContentData = event.data;
 
+              // A whitespace flood still counts as stream activity, so `resetIdle`
+              // keeps the idle timeout from ever firing. Bound the run explicitly.
               let whitespaceRunStart = consecutiveWhitespace > 0 ? 0 : -1;
               let runawayWhitespace = false;
               for (let index = 0; index < event.data.length; index++) {
@@ -718,6 +871,7 @@ export function streamKiro(
                   whitespaceRunStart = -1;
                 }
               }
+
               const content = runawayWhitespace ? event.data.slice(0, Math.max(0, whitespaceRunStart)) : event.data;
               if (content) {
                 totalContent += content;
@@ -743,7 +897,6 @@ export function streamKiro(
               break;
             }
             case "toolUse": {
-              finishNativeReasoning();
               const tc = event.data;
               sawAnyToolCalls = true;
               if (!currentToolCall || currentToolCall.toolUseId !== tc.toolUseId) {
@@ -766,13 +919,6 @@ export function streamKiro(
             }
             case "usage": {
               usageEvent = event.data;
-              break;
-            }
-            // Kiro's authoritative terminal marker. Recorded for diagnosis only —
-            // it must not drive stopReason, because gpt-5.6-* reports END_TURN
-            // even on turns that emit real tool calls.
-            case "metadata": {
-              rawStopReason = event.data.stopReason;
               break;
             }
             case "error": {
@@ -802,7 +948,7 @@ export function streamKiro(
         if (currentToolCall && emitToolCall(currentToolCall, output, stream)) {
           emittedToolCalls++;
         }
-        finishNativeReasoning();
+        endNativeThinking();
         if (thinkingParser) {
           thinkingParser.finalize();
           textBlockIndex = thinkingParser.getTextBlockIndex();
@@ -840,17 +986,6 @@ export function streamKiro(
           if (/^\s*(\.+|continue)\s*$/i.test(textBlock.text)) {
             textBlock.text = "";
           }
-        }
-        const hasText = textBlockIndex !== null && (output.content[textBlockIndex] as TextContent).text.length > 0;
-        const truncatedTextOnly = hasText && !receivedContextUsage && !sawAnyToolCalls;
-        if (truncatedTextOnly && !truncatedTextRetryAttempted) {
-          truncatedTextRetryAttempted = true;
-          debugLog("response.truncated_text_retry", {
-            textLen: (output.content[textBlockIndex as number] as TextContent).text.length,
-          });
-          output.content = [];
-          textBlockIndex = null;
-          continue;
         }
         if (textBlockIndex !== null)
           stream.push({
@@ -891,6 +1026,7 @@ export function streamKiro(
         // input), don't retry — the API did respond, it just sent malformed
         // tool calls. Retrying would likely produce the same result. The
         // stopReason fix below prevents the agent loop stall.
+        const hasText = textBlockIndex !== null && (output.content[textBlockIndex] as TextContent).text.length > 0;
         const responseText = hasText ? (output.content[textBlockIndex as number] as TextContent).text : "";
         const isEchoLoop = hasText && !sawAnyToolCalls && /^\s*(continue|\.+)\s*$/i.test(responseText);
         if ((!hasText && !sawAnyToolCalls) || isEchoLoop) {
@@ -927,9 +1063,6 @@ export function streamKiro(
           output.stopReason = "length";
         } else {
           output.stopReason = emittedToolCalls > 0 ? "toolUse" : "stop";
-        }
-        if (rawStopReason !== undefined) {
-          output.rawStopReason = rawStopReason;
         }
         stream.push({ type: "done", reason: output.stopReason as "stop" | "toolUse", message: output });
         debugLog("response.done", {

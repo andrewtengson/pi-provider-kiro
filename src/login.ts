@@ -33,6 +33,10 @@ function getSignal(callbacks: OAuthLoginCallbacks): AbortSignal | undefined {
   return (callbacks as unknown as { signal?: AbortSignal }).signal;
 }
 
+// Per-request timeout for the OIDC register/authorize calls, so one unreachable
+// regional endpoint cannot stall region detection indefinitely.
+const PROBE_TIMEOUT_MS = 15_000;
+
 // Regions to probe when auto-detecting the IAM Identity Center OIDC region.
 // Must cover every SSO region that resolveApiRegion() maps to a Kiro API region,
 // plus the API regions themselves. Ordered by likelihood.
@@ -113,6 +117,7 @@ async function tryRegisterAndAuthorize(
 
   const regResp = await fetch(`${oidcEndpoint}/client/register`, {
     method: "POST",
+    signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     headers: { "Content-Type": "application/json", "User-Agent": "pi-cli" },
     body: JSON.stringify({
       clientName: "pi-cli",
@@ -126,6 +131,7 @@ async function tryRegisterAndAuthorize(
 
   const devResp = await fetch(`${oidcEndpoint}/device_authorization`, {
     method: "POST",
+    signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     headers: { "Content-Type": "application/json", "User-Agent": "pi-cli" },
     body: JSON.stringify({ clientId, clientSecret, startUrl }),
   });
@@ -158,7 +164,8 @@ async function runDeviceCodeFlowWithRegionDetection(
   getProgress(callbacks)?.("Detecting your Identity Center region...");
 
   for (const region of IDC_PROBE_REGIONS) {
-    const result = await tryRegisterAndAuthorize(startUrl, region);
+    // A hung or broken endpoint must not abort the whole probe: fail open to the next region.
+    const result = await tryRegisterAndAuthorize(startUrl, region).catch(() => null);
     if (result) {
       getProgress(callbacks)?.(`Region detected: ${region}`);
       return pollDeviceCode(

@@ -7,19 +7,37 @@ export type KiroEffortField = "reasoning" | "output_config";
 export interface KiroEffortConfig {
   field: KiroEffortField;
   values: readonly string[];
-  /** True when the model's schema offers `thinking.display: "summarized"`. */
   summarizedThinking: boolean;
 }
 
 export type KiroAdditionalModelRequestFields =
   | { reasoning: { effort: string } }
-  | { output_config: { effort: string }; thinking: { type: "adaptive"; display?: "summarized" } };
+  | {
+      output_config: { effort: string };
+      thinking: { type: "adaptive"; display?: "summarized" };
+    };
 
 type ModelWithKiroEffortMetadata = Model<Api> & {
   additionalModelRequestFieldsSchema?: unknown;
 };
 
+const GPT_EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"] as const;
+const CLAUDE_EXTENDED_EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"] as const;
+const CLAUDE_MAX_EFFORT_VALUES = ["low", "medium", "high", "max"] as const;
 const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"] as const;
+
+const CLAUDE_EXTENDED_EFFORT_MODELS = new Set([
+  "claude-opus-4.8",
+  "claude-opus-4.7",
+  "claude-sonnet-5",
+  "claude-fable-5",
+]);
+const CLAUDE_MAX_EFFORT_MODELS = new Set([
+  "claude-opus-4.6",
+  "claude-sonnet-4.6",
+  "claude-opus-4.6-1m",
+  "claude-sonnet-4.6-1m",
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -49,52 +67,27 @@ export function deriveKiroEffort(schema: unknown): KiroEffortConfig | undefined 
   return undefined;
 }
 
-/**
- * Known-family compatibility used only before catalog schema metadata is available.
- *
- * The effort *field* (GPT `reasoning.effort` vs Claude `output_config.effort`) is
- * inherent to the Kiro API and cannot be derived without the schema, so it is
- * keyed off the model family. The allowed effort *values* are taken from the
- * model's own `thinkingLevelMap` — the same source of truth the catalog uses —
- * rather than a duplicated hardcoded model list:
- *   - GPT always exposes `reasoning.effort`; when no map is present it keeps the
- *     historical low→xhigh ceiling.
- *   - Claude only exposes `output_config.effort` when the model advertises an
- *     extended thinking level (`xhigh`/`max`) via `thinkingLevelMap`; models
- *     without one (e.g. Sonnet 4.5) fall through to prompt-injected thinking.
- */
-export function fallbackKiroEffort(
-  model: ModelWithKiroEffortMetadata,
-  kiroModelId: string,
-): KiroEffortConfig | undefined {
+/** Known-model compatibility used only before catalog schema metadata is available. */
+export function fallbackKiroEffort(kiroModelId: string): KiroEffortConfig | undefined {
   const normalizedId = kiroModelId.toLowerCase().replace(/(\d)-(\d)/g, "$1.$2");
-  const map = model.thinkingLevelMap;
-  const extras: string[] = [];
-  if (map?.xhigh) extras.push("xhigh");
-  if (map?.max) extras.push("max");
-
+  // Kiro reports GPT ids as `gpt-5.6-sol`; the `openai-` prefix only appears in
+  // some catalog surfaces. Match both so a cold cache still sends effort.
   if (normalizedId.startsWith("openai-gpt") || normalizedId.startsWith("gpt")) {
-    return {
-      field: "reasoning",
-      values: ["low", "medium", "high", ...(extras.length > 0 ? extras : ["xhigh"])],
-      summarizedThinking: false,
-    };
+    return { field: "reasoning", values: GPT_EFFORT_VALUES, summarizedThinking: false };
   }
-  if (normalizedId.startsWith("claude") && extras.length > 0) {
-    return { field: "output_config", values: ["low", "medium", "high", ...extras], summarizedThinking: true };
+  if (CLAUDE_EXTENDED_EFFORT_MODELS.has(normalizedId)) {
+    return { field: "output_config", values: CLAUDE_EXTENDED_EFFORT_VALUES, summarizedThinking: true };
+  }
+  if (CLAUDE_MAX_EFFORT_MODELS.has(normalizedId)) {
+    return { field: "output_config", values: CLAUDE_MAX_EFFORT_VALUES, summarizedThinking: false };
   }
   return undefined;
 }
 
-/** Prefer authoritative schema metadata; never replace a present schema with a known-model guess. */
-export function getKiroEffortConfig(
-  model: ModelWithKiroEffortMetadata,
-  kiroModelId: string,
-): KiroEffortConfig | undefined {
-  if (model.additionalModelRequestFieldsSchema !== undefined) {
-    return deriveKiroEffort(model.additionalModelRequestFieldsSchema);
-  }
-  return fallbackKiroEffort(model, kiroModelId);
+/** Prefer catalog schema; fall back only when it is absent. */
+export function getKiroEffortConfig(schema: unknown, kiroModelId: string): KiroEffortConfig | undefined {
+  if (schema !== undefined) return deriveKiroEffort(schema);
+  return fallbackKiroEffort(kiroModelId);
 }
 
 /** Map a canonical Pi level to a value that is present in the selected model's Kiro enum. */
@@ -139,19 +132,18 @@ export function buildKiroAdditionalModelRequestFields(
 ): KiroAdditionalModelRequestFields | undefined {
   if (!level || !model.reasoning) return undefined;
 
-  const config = getKiroEffortConfig(model, kiroModelId);
+  const config = getKiroEffortConfig(model.additionalModelRequestFieldsSchema, kiroModelId);
   if (!config) return undefined;
   const effort = mapPiLevelToKiroEffort(model, level, config);
   if (!effort) return undefined;
 
-  // Kiro defaults thinking.display to "omitted", which suppresses every
-  // reasoningContentEvent even with adaptive thinking enabled. Send
-  // display: "summarized" only when the model's schema advertises it.
-  // Verified live on claude-opus-5 and claude-opus-4.8.
   return config.field === "output_config"
     ? {
         output_config: { effort },
-        thinking: { type: "adaptive", ...(config.summarizedThinking ? { display: "summarized" as const } : {}) },
+        thinking: {
+          type: "adaptive",
+          ...(config.summarizedThinking ? { display: "summarized" as const } : {}),
+        },
       }
     : { reasoning: { effort } };
 }
