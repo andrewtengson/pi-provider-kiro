@@ -3794,4 +3794,32 @@ describe("Feature 9: Streaming Integration", () => {
 
     vi.unstubAllGlobals();
   });
+
+  it("aborts the stream when a whitespace run exceeds the bound", async () => {
+    // A whitespace flood resets the idle timer on every frame, so the idle
+    // timeout can never fire. The explicit bound must stop it instead.
+    const flood = JSON.stringify(" ".repeat(5000));
+    vi.stubGlobal("fetch", mockFetchOk(`{"content":"Working"}{"content":${flood}}`));
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "test-token" }));
+
+    const error = events.find((e) => e.type === "error");
+    expect(error).toBeDefined();
+    expect(error?.type === "error" && error.error.errorMessage).toContain("runaway whitespace");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps ordinary whitespace-containing text intact", async () => {
+    vi.stubGlobal("fetch", mockFetchOk('{"content":"line one\\n\\nline two\\n"}{"contextUsagePercentage":5}'));
+
+    const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "test-token" }));
+
+    const done = events.find((e) => e.type === "done");
+    expect(done).toBeDefined();
+    const text = done?.type === "done" ? done.message.content.find((b) => b.type === "text") : undefined;
+    expect(text?.type === "text" && text.text).toBe("line one\n\nline two\n");
+
+    vi.unstubAllGlobals();
+  });
 });

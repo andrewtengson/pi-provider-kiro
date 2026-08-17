@@ -79,6 +79,8 @@ import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js
 
 const CAPACITY_LOG_DIR = join(homedir(), ".pi", "logs");
 const CAPACITY_LOG_FILE = join(CAPACITY_LOG_DIR, "capacity-retries.log");
+/** Upper bound on a single whitespace run before the stream is treated as runaway. */
+const MAX_CONSECUTIVE_WHITESPACE = 4096;
 
 const eventStreamMarshaller = new UniversalEventStreamMarshaller({
   utf8Encoder: (input: Uint8Array) => new TextDecoder().decode(input),
@@ -677,6 +679,7 @@ export function streamKiro(
         const bodyReader = (response.body as unknown as ReadableStream<Uint8Array>).getReader();
         let totalContent = "";
         let lastContentData = "";
+        let consecutiveWhitespace = 0;
         let usageEvent: { inputTokens?: number; outputTokens?: number } | null = null;
         let receivedContextUsage = false;
         let rawStopReason: string | undefined;
@@ -850,17 +853,46 @@ export function streamKiro(
               endNativeThinking();
               if (event.data === lastContentData) continue;
               lastContentData = event.data;
-              totalContent += event.data;
-              if (thinkingParser) {
-                thinkingParser.processChunk(event.data);
-              } else {
-                if (textBlockIndex === null) {
-                  textBlockIndex = output.content.length;
-                  output.content.push({ type: "text", text: "" });
-                  stream.push({ type: "text_start", contentIndex: textBlockIndex, partial: output });
+
+              // A whitespace flood still counts as stream activity, so `resetIdle`
+              // keeps the idle timeout from ever firing. Bound the run explicitly.
+              let whitespaceRunStart = consecutiveWhitespace > 0 ? 0 : -1;
+              let runawayWhitespace = false;
+              for (let index = 0; index < event.data.length; index++) {
+                if (/\s/.test(event.data[index] ?? "")) {
+                  if (whitespaceRunStart < 0) whitespaceRunStart = index;
+                  consecutiveWhitespace++;
+                  if (consecutiveWhitespace > MAX_CONSECUTIVE_WHITESPACE) {
+                    runawayWhitespace = true;
+                    break;
+                  }
+                } else {
+                  consecutiveWhitespace = 0;
+                  whitespaceRunStart = -1;
                 }
-                (output.content[textBlockIndex] as TextContent).text += event.data;
-                stream.push({ type: "text_delta", contentIndex: textBlockIndex, delta: event.data, partial: output });
+              }
+
+              const content = runawayWhitespace ? event.data.slice(0, Math.max(0, whitespaceRunStart)) : event.data;
+              if (content) {
+                totalContent += content;
+                if (thinkingParser) {
+                  thinkingParser.processChunk(content);
+                } else {
+                  if (textBlockIndex === null) {
+                    textBlockIndex = output.content.length;
+                    output.content.push({ type: "text", text: "" });
+                    stream.push({ type: "text_start", contentIndex: textBlockIndex, partial: output });
+                  }
+                  (output.content[textBlockIndex] as TextContent).text += content;
+                  stream.push({ type: "text_delta", contentIndex: textBlockIndex, delta: content, partial: output });
+                }
+              }
+              if (runawayWhitespace) {
+                const cancelReader = (bodyReader as { cancel?: () => Promise<unknown> }).cancel;
+                if (cancelReader) void cancelReader.call(bodyReader).catch(() => {});
+                throw new Error(
+                  `Kiro API stream aborted after runaway whitespace exceeded ${MAX_CONSECUTIVE_WHITESPACE} consecutive characters`,
+                );
               }
               break;
             }
