@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.10.1] - 2026-08-24
+
+### Fixed
+
+- Carry the profile ARN through the IDC kiro-cli token path and add a `KIRO_PROFILE_ARN` environment override with highest precedence, so users with multiple Kiro profiles can pin the one they want instead of silently getting the first profile's reduced model catalog ([#110](https://github.com/mikeyobrien/pi-provider-kiro/issues/110)). Every profile resolution source (env / provided / network) is debug-logged as `profile.resolve`.
+- Recover tool calls emitted as XML-dialect markup in assistant text for models that fall back to that dialect, instead of surfacing the markup as visible text ([#125](https://github.com/mikeyobrien/pi-provider-kiro/pull/125)).
+- Stop logging capacity retries to stderr; retry accounting still happens, the console noise does not ([#116](https://github.com/mikeyobrien/pi-provider-kiro/pull/116)).
+- Resolve a missing Kiro profile when the SSO-derived API region is wrong ([#104](https://github.com/mikeyobrien/pi-provider-kiro/issues/104)). `ListAvailableProfiles` is regional to where the profile actually lives, not to the login region, so a token whose profile is in `us-east-1` while the SSO region maps to `eu-central-1` returned `{ profiles: [] }` and the provider gave up. Profile resolution now probes both `us-east-1` and `eu-central-1` when the primary region comes back empty, caches the result, and routes `ListAvailableModels` to the region where the profile was found. The failure message now lists every attempted region and directs the user to `kiro-cli whoami` when the profile cannot be reached in any canonical region.
+- Preserve every literal `<thinking>`, ` thinking`, `<reasoning>`, or `<thought>` region in one streamed response as its own thinking block instead of leaking every region after the first into visible assistant text.
+- Keep parsed thinking blocks in the order the wire delivered them instead of splicing them ahead of text already emitted. The parser moved a thinking block into the index of an existing text block to make the content array read thinking → text, which made the persisted array contradict the stream and reused one `contentIndex` for two different blocks — an index-addressed consumer such as pi-mono's proxy transport overwrote the text it had already placed and then threw on the following `text_end`. Empty tagged regions are still materialized. Presentation order is unaffected: outbound history still prepends every thinking block, and renderers drive thinking from stream events.
+
 ## [0.10.0] - 2026-08-16
 
 ### Fixed
@@ -214,6 +227,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release: 17 models across 7 families, OAuth device code flow, kiro-cli SQLite credential fallback, streaming pipeline with thinking tag parser
 
 [Unreleased]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.3...HEAD
+[0.10.1]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/mikeyobrien/pi-provider-kiro/compare/v0.9.1...v0.9.2

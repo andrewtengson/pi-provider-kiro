@@ -16,6 +16,7 @@ import { capacityRetryConfig, retryConfig } from "../src/retry.js";
 import { resetProfileArnCache, streamKiro } from "../src/stream.js";
 import { EMPTY_CONTENT_PLACEHOLDER, type KiroHistoryEntry } from "../src/transform.js";
 import { concatMessages, encodeEventMessage } from "./helpers/event-stream.js";
+import { RECORD_279_COMMAND, RECORD_279_SUMMARY, RECORD_279_TEXT } from "./helpers/invoke-fixture.js";
 
 const ts = Date.now();
 const zeroUsage = {
@@ -612,7 +613,9 @@ describe("Feature 9: Streaming Integration", () => {
 
   it("fails before inference when profile discovery returns no profile", async () => {
     resetProfileArnCache(false);
-    const mockFetch = vi.fn().mockResolvedValueOnce({
+    // Both canonical management regions return an empty profile list (#104):
+    // the provider probes the fallback region before failing to inference.
+    const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ profiles: [] }),
     });
@@ -620,8 +623,9 @@ describe("Feature 9: Streaming Integration", () => {
 
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
 
-    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
     expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
+    expect(mockFetch.mock.calls[1][0]).toBe("https://management.eu-central-1.kiro.dev/List-Available-Profiles");
     const error = events.find((event) => event.type === "error");
     expect(error?.type === "error" && error.error.errorMessage).toContain("returned no profile");
 
@@ -793,6 +797,123 @@ describe("Feature 9: Streaming Integration", () => {
       .map((e) => (e as { delta: string }).delta)
       .join("");
     expect(textDeltas).toContain("The answer");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("preserves multiple thinking regions through the streamed response", async () => {
+    const mockFetch = mockFetchChunked([
+      '{"content":"<thinking>first</thinking>\\n\\nmid<rea"}',
+      '{"content":"soning>second</reasoning>\\n\\nend"}',
+      '{"contextUsagePercentage":15}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const thinkingStarts = events.filter((event) => event.type === "thinking_start");
+    const thinkingEnds = events.filter((event) => event.type === "thinking_end");
+
+    expect(thinkingStarts.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.content)).toEqual(["first", "second"]);
+
+    const textDeltas = events
+      .filter((event) => event.type === "text_delta")
+      .map((event) => event.delta)
+      .join("");
+    expect(textDeltas).toBe("midend");
+    expect(textDeltas).not.toMatch(/<\/?(?:thinking|think|reasoning|thought)>/);
+
+    const textEnd = events.find((event) => event.type === "text_end");
+    expect(textEnd?.type === "text_end" && [textEnd.contentIndex, textEnd.content]).toEqual([3, "end"]);
+
+    const done = events.find((event) => event.type === "done");
+    const content = done?.type === "done" ? done.message.content : [];
+    expect(content).toEqual([
+      { type: "thinking", thinking: "first" },
+      { type: "text", text: "mid" },
+      { type: "thinking", thinking: "second" },
+      { type: "text", text: "end" },
+    ]);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("preserves empty first and later thinking regions through the streamed response", async () => {
+    const mockFetch = mockFetchChunked([
+      '{"content":"<thought></thought>mid<rea"}',
+      '{"content":"soning></reasoning>end"}',
+      '{"contextUsagePercentage":15}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const thinkingStarts = events.filter((event) => event.type === "thinking_start");
+    const thinkingEnds = events.filter((event) => event.type === "thinking_end");
+
+    expect(thinkingStarts.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.contentIndex)).toEqual([0, 2]);
+    expect(thinkingEnds.map((event) => event.content)).toEqual(["", ""]);
+
+    const textDeltas = events
+      .filter((event) => event.type === "text_delta")
+      .map((event) => event.delta)
+      .join("");
+    expect(textDeltas).toBe("midend");
+
+    const textEnd = events.find((event) => event.type === "text_end");
+    expect(textEnd?.type === "text_end" && [textEnd.contentIndex, textEnd.content]).toEqual([3, "end"]);
+
+    const done = events.find((event) => event.type === "done");
+    const content = done?.type === "done" ? done.message.content : [];
+    expect(content).toEqual([
+      { type: "thinking", thinking: "" },
+      { type: "text", text: "mid" },
+      { type: "thinking", thinking: "" },
+      { type: "text", text: "end" },
+    ]);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps one block per contentIndex when thinking arrives after text", async () => {
+    const mockFetch = mockFetchChunked([
+      '{"content":"Hello world"}',
+      '{"content":"<thinking>reasoning"}',
+      '{"content":"</thinking>"}',
+      '{"contextUsagePercentage":15}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+    const census = events
+      .filter((e) => (e as { contentIndex?: number }).contentIndex !== undefined)
+      .map((e) => `${e.type}@${(e as { contentIndex: number }).contentIndex}`);
+
+    // The parser appends the thinking block, so the text block keeps index 0
+    // for the whole stream and `text_end` names the slot `text_start` opened.
+    // An earlier revision spliced thinking into index 0 and shifted the text
+    // block to 1, which emitted `thinking_start@0` over the already-announced
+    // text block and then `text_end@1` at a slot no `text_start` ever opened —
+    // an index-addressed consumer lost the text and threw on the close.
+    expect(census).toEqual([
+      "text_start@0",
+      "text_delta@0",
+      "thinking_start@1",
+      "thinking_delta@1",
+      "thinking_end@1",
+      "text_end@0",
+    ]);
+
+    const textEnd = events.find((e) => e.type === "text_end");
+    expect(textEnd?.type === "text_end" && textEnd.content).toBe("Hello world");
+
+    const done = events.find((e) => e.type === "done");
+    const content = done?.type === "done" ? done.message.content : [];
+    expect(content.map((b) => b.type)).toEqual(["text", "thinking"]);
 
     vi.unstubAllGlobals();
   });
@@ -3347,6 +3468,107 @@ describe("Feature 9: Streaming Integration", () => {
     const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
     expect(toolCalls).toHaveLength(1);
     expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].name).toBe("bash");
+
+    vi.unstubAllGlobals();
+  });
+
+  // =========================================================================
+  // XML-dialect tool call recovery (<invoke name="...">)
+  // =========================================================================
+
+  it("recovers an XML-dialect tool call and returns stopReason toolUse (record 279)", async () => {
+    // Reproduces the observed stall: the model emitted its shell call as text in
+    // Anthropic's XML function-calling dialect, so the turn ended
+    // stopReason:"stop" with zero toolCall blocks and the agent loop parked at
+    // the prompt. The assertion that matters is the stopReason flip — that is
+    // what keeps an unattended session moving.
+    const mockFetch = mockFetchOk(`${JSON.stringify({ content: RECORD_279_TEXT })}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+
+    const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
+    expect(toolCalls).toHaveLength(1);
+    const call = toolCalls?.[0];
+    expect(call?.type === "toolCall" && call.name).toBe("shell");
+    // Byte-exact all the way through JSON.stringify → emitToolCall → JSON.parse.
+    expect(call?.type === "toolCall" && call.arguments.command).toBe(RECORD_279_COMMAND);
+    expect(call?.type === "toolCall" && call.arguments.summary).toBe(RECORD_279_SUMMARY);
+
+    const textBlock = msg?.content.find((b) => b.type === "text");
+    expect(textBlock?.type === "text" && textBlock.text).not.toContain("<invoke name=");
+
+    // The fix: "stop" would stall the agent loop; "toolUse" continues it.
+    expect(done?.type === "done" && done.reason).toBe("toolUse");
+    expect(msg?.stopReason).toBe("toolUse");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("recovers XML-dialect calls split across stream chunks", async () => {
+    // The dialect arrives as ordinary content deltas, so a tag can straddle a
+    // chunk boundary. Recovery runs on the assembled text block, after the
+    // stream ends, so boundaries must not matter.
+    const mid = Math.floor(RECORD_279_TEXT.length / 2);
+    const mockFetch = mockFetchChunked([
+      JSON.stringify({ content: RECORD_279_TEXT.slice(0, mid) }),
+      JSON.stringify({ content: RECORD_279_TEXT.slice(mid) }),
+      '{"contextUsagePercentage":10}',
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].arguments.command).toBe(RECORD_279_COMMAND);
+    expect(done?.type === "done" && done.reason).toBe("toolUse");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("does not recover XML-dialect calls when native tool calls exist", async () => {
+    const toolPayload = '{"name":"bash","toolUseId":"tc1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}';
+    const mockFetch = mockFetchOk(
+      `${JSON.stringify({ content: RECORD_279_TEXT })}${toolPayload}{"contextUsagePercentage":10}`,
+    );
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    const toolCalls = msg?.content.filter((b) => b.type === "toolCall");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls?.[0].type === "toolCall" && toolCalls?.[0].name).toBe("bash");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("leaves prose that merely quotes the dialect alone", async () => {
+    // Model output analysing this bug quotes the dialect inside a code fence.
+    // Recovering from that would execute a command out of documentation.
+    const prose = ["The leak looks like:", "```", RECORD_279_TEXT, "```", "Want me to file a card?"].join("\n");
+    const mockFetch = mockFetchOk(`${JSON.stringify({ content: prose })}{"contextUsagePercentage":10}`);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = done?.type === "done" ? done.message : undefined;
+    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
+    const textBlock = msg?.content.find((b) => b.type === "text");
+    expect(textBlock?.type === "text" && textBlock.text).toBe(prose);
+    expect(done?.type === "done" && done.reason).toBe("stop");
 
     vi.unstubAllGlobals();
   });
