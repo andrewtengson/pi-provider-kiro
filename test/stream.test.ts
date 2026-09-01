@@ -8,7 +8,7 @@ import type {
   TextContent,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
-import { isContextOverflow } from "@earendil-works/pi-ai/compat";
+import { isContextOverflow, isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { findJsonEnd } from "../src/bracket-tool-parser.js";
 import { validateKiroConversation, validateKiroToolStructure } from "../src/history-validator.js";
@@ -148,9 +148,9 @@ function encodeBody(body: string): Uint8Array {
   return concatMessages(...parseJsonObjects(body).map((o) => encodeEventMessage(o)));
 }
 
-function mockFetchOk(body: string) {
+function makeOkResponse(body: string): Response {
   const frames = encodeBody(body);
-  return vi.fn().mockResolvedValueOnce({
+  return {
     ok: true,
     body: {
       getReader: () => ({
@@ -162,7 +162,21 @@ function mockFetchOk(body: string) {
       }),
       cancel: async () => {},
     },
-  });
+  } as unknown as Response;
+}
+
+function mockFetchOk(body: string) {
+  return vi.fn().mockResolvedValueOnce(makeOkResponse(body));
+}
+
+function makeRequestRateResponse(headers?: Record<string, string>): Response {
+  return {
+    ok: false,
+    status: 429,
+    statusText: "Too Many Requests",
+    headers: new Headers(headers),
+    text: () => Promise.resolve('{"message":"Please wait before trying again","reason":"USER_REQUEST_RATE_EXCEEDED"}'),
+  } as unknown as Response;
 }
 
 function mockFetchChunked(chunks: string[]) {
@@ -490,7 +504,12 @@ describe("Feature 9: Streaming Integration", () => {
     const freshProfileArn = "arn:aws:codewhisperer:us-east-1:123:profile/FRESH";
     const mockFetch = vi
       .fn()
+      // Primary (us-east-1): stale token rejected
       .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
+      // Fallback (eu-central-1): stale token rejected there too — genuine auth rejection,
+      // so the probe rethrows 403 and the #107 newer-credential path engages
+      .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
+      // Re-probe with the newer kiro-cli token: profile found
       .mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve({ profiles: [{ arn: freshProfileArn }] }),
@@ -528,11 +547,14 @@ describe("Feature 9: Streaming Integration", () => {
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "stale-token" }));
 
     expect(refreshSpy).not.toHaveBeenCalled();
-    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
     expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe("Bearer stale-token");
-    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(mockFetch.mock.calls[0][0]).toBe("https://management.us-east-1.kiro.dev/List-Available-Profiles");
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer stale-token");
+    expect(mockFetch.mock.calls[1][0]).toBe("https://management.eu-central-1.kiro.dev/List-Available-Profiles");
     expect(mockFetch.mock.calls[2][1].headers.Authorization).toBe("Bearer fresh-token");
-    expect(JSON.parse(mockFetch.mock.calls[2][1].body).profileArn).toBe(freshProfileArn);
+    expect(mockFetch.mock.calls[3][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(JSON.parse(mockFetch.mock.calls[3][1].body).profileArn).toBe(freshProfileArn);
     expect(events.find((event) => event.type === "done")).toBeDefined();
 
     getCredsSpy.mockRestore();
@@ -545,6 +567,7 @@ describe("Feature 9: Streaming Integration", () => {
     const freshProfileArn = "arn:aws:codewhisperer:us-east-1:123:profile/REFRESHED";
     const mockFetch = vi
       .fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
       .mockResolvedValueOnce({ ok: false, status: 403, statusText: "Forbidden" })
       .mockResolvedValueOnce({
         ok: true,
@@ -580,10 +603,11 @@ describe("Feature 9: Streaming Integration", () => {
     const events = await collect(streamKiro(makeModel(), makeContext(), { apiKey: "stale-token" }));
 
     expect(refreshSpy).toHaveBeenCalledOnce();
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
     expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe("Bearer stale-token");
-    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer fresh-token");
-    expect(JSON.parse(mockFetch.mock.calls[1][1].body).profileArn).toBe(freshProfileArn);
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer stale-token");
+    expect(mockFetch.mock.calls[2][1].headers.Authorization).toBe("Bearer fresh-token");
+    expect(JSON.parse(mockFetch.mock.calls[2][1].body).profileArn).toBe(freshProfileArn);
     expect(events.find((event) => event.type === "done")).toBeDefined();
 
     getCredsSpy.mockRestore();
@@ -1203,7 +1227,7 @@ describe("Feature 9: Streaming Integration", () => {
   // Images in history don't break session (regression)
   // =========================================================================
 
-  it("strips images from history entries so they don't bloat the request", async () => {
+  it("keeps the newest bounded image in history for follow-up recognition", async () => {
     const imageContent: ImageContent = { type: "image", data: "x".repeat(100000), mimeType: "image/png" };
     const context: Context = {
       systemPrompt: "You are helpful",
@@ -1232,11 +1256,9 @@ describe("Feature 9: Streaming Integration", () => {
     expect(done).toBeDefined();
     expect(done?.type === "done" && done.message.stopReason).toBe("stop");
 
-    // History should NOT contain the image base64 data
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     const historyStr = JSON.stringify(body.conversationState.history ?? []);
-    expect(historyStr).not.toContain("x".repeat(1000));
-    // But the history entry text should still be there
+    expect(historyStr).toContain("x".repeat(1000));
     expect(historyStr).toContain("Look at this");
 
     vi.unstubAllGlobals();
@@ -2349,7 +2371,7 @@ describe("Feature 9: Streaming Integration", () => {
       ok: false,
       status: 429,
       statusText: "Too Many Requests",
-      text: () => Promise.resolve("MONTHLY_REQUEST_COUNT exceeded"),
+      text: () => Promise.resolve('{"message":"Monthly quota exhausted","reason":"MONTHLY_REQUEST_COUNT"}'),
     });
     vi.stubGlobal("fetch", mockFetch);
 
@@ -2793,6 +2815,137 @@ describe("Feature 9: Streaming Integration", () => {
   });
 
   // =========================================================================
+  // Response-header timeout
+  // =========================================================================
+
+  it("times out a fetch that never returns response headers", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.requestHeaderTimeoutMs;
+    retryConfig.requestHeaderTimeoutMs = 10;
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(7_100);
+      const events = await eventsPromise;
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      const error = events.find((event) => event.type === "error");
+      expect(error?.type === "error" && error.error.errorMessage).toBe(
+        "Kiro API error: response headers timeout after max retries",
+      );
+    } finally {
+      retryConfig.requestHeaderTimeoutMs = originalTimeout;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("preserves caller cancellation during the response-header wait", async () => {
+    const controller = new AbortController();
+    const removeListenerSpy = vi.spyOn(controller.signal, "removeEventListener");
+    let notifyFetchStarted: (() => void) | undefined;
+    const fetchStarted = new Promise<void>((resolve) => {
+      notifyFetchStarted = resolve;
+    });
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      notifyFetchStarted?.();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const eventsPromise = collect(
+        streamKiro(makeModel(), makeContext(), { apiKey: "tok", signal: controller.signal }),
+      );
+      await fetchStarted;
+      controller.abort(new DOMException("cancelled by caller", "AbortError"));
+      const events = await eventsPromise;
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const error = events.find((event) => event.type === "error");
+      expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
+      expect(error?.type === "error" && error.error.errorMessage).toContain("cancelled by caller");
+      expect(error?.type === "error" && error.error.errorMessage).not.toContain("response headers timeout");
+      expect(removeListenerSpy).toHaveBeenCalledWith("abort", expect.any(Function));
+    } finally {
+      removeListenerSpy.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("clears the response-header timer and caller listener after headers arrive", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.requestHeaderTimeoutMs;
+    retryConfig.requestHeaderTimeoutMs = 10;
+    const controller = new AbortController();
+    const removeListenerSpy = vi.spyOn(controller.signal, "removeEventListener");
+    const fetchMock = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const events = await collect(
+        streamKiro(makeModel(), makeContext(), { apiKey: "tok", signal: controller.signal }),
+      );
+      const requestInit = fetchMock.mock.calls[0]?.[1] as RequestInit;
+      const responseHeaderSignal = requestInit.signal as AbortSignal;
+
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+      expect(responseHeaderSignal.aborted).toBe(false);
+      expect(removeListenerSpy).toHaveBeenCalledWith("abort", expect.any(Function));
+      await vi.advanceTimersByTimeAsync(11);
+      expect(responseHeaderSignal.aborted).toBe(false);
+    } finally {
+      retryConfig.requestHeaderTimeoutMs = originalTimeout;
+      removeListenerSpy.mockRestore();
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("retries a response-header timeout and succeeds", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.requestHeaderTimeoutMs;
+    retryConfig.requestHeaderTimeoutMs = 10;
+    const successfulFetch = mockFetchOk('{"content":"ok"}{"contextUsagePercentage":5}');
+    const requestSignals: AbortSignal[] = [];
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      requestSignals.push(init?.signal as AbortSignal);
+      if (requestSignals.length === 1) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        });
+      }
+      return successfulFetch();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(1_010);
+      const events = await eventsPromise;
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(requestSignals[0]?.reason).toMatchObject({ name: "TimeoutError" });
+      expect(requestSignals[1]?.aborted).toBe(false);
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+      await vi.advanceTimersByTimeAsync(11);
+      expect(requestSignals[1]?.aborted).toBe(false);
+    } finally {
+      retryConfig.requestHeaderTimeoutMs = originalTimeout;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // =========================================================================
   // First-token timeout (Task 1.2)
   // =========================================================================
 
@@ -2907,7 +3060,136 @@ describe("Feature 9: Streaming Integration", () => {
   // Provider-level HTTP error handling
   // =========================================================================
 
-  it("propagates 429 immediately so pi-coding-agent can own outer retries", async () => {
+  it.each([
+    ["retry-after-ms milliseconds", { "retry-after-ms": "25" }, 25],
+    ["retry-after seconds", { "retry-after": "0.025" }, 25],
+    ["retry-after HTTP date", { "retry-after": "Sat, 29 Aug 2026 00:00:05 GMT" }, 5000],
+    ["x-ratelimit-reset-after seconds", { "x-ratelimit-reset-after": "0.025" }, 25],
+  ])("honors %s for exact USER_REQUEST_RATE_EXCEEDED and then succeeds", async (_name, headers, delayMs) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-29T00:00:00Z"));
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeRequestRateResponse(headers))
+      .mockResolvedValueOnce(makeOkResponse('{"content":"ok"}{"contextUsagePercentage":5}'));
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mockFetch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(delayMs - 1);
+      expect(mockFetch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([
+    ["an absent hint", undefined],
+    [
+      "malformed, non-finite, and negative hints",
+      { "retry-after-ms": "not-a-number", "retry-after": "-1", "x-ratelimit-reset-after": "Infinity" },
+    ],
+  ])("uses the 10-second request-window fallback for %s", async (_name, headers) => {
+    vi.useFakeTimers();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeRequestRateResponse(headers))
+      .mockResolvedValueOnce(makeOkResponse('{"content":"ok"}{"contextUsagePercentage":5}'));
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(mockFetch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("caps a longer server request-window hint at 10 seconds", async () => {
+    vi.useFakeTimers();
+    const mockFetch = vi
+      .fn()
+      .mockResolvedValueOnce(makeRequestRateResponse({ "retry-after-ms": "15000" }))
+      .mockResolvedValueOnce(makeOkResponse('{"content":"ok"}{"contextUsagePercentage":5}'));
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(mockFetch).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(events.find((event) => event.type === "done")).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("preserves caller cancellation during request-window backoff", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const mockFetch = vi.fn().mockResolvedValue(makeRequestRateResponse());
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(
+        streamKiro(makeModel(), makeContext(), { apiKey: "tok", signal: controller.signal }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      controller.abort(new DOMException("cancelled by caller", "AbortError"));
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledOnce();
+      const error = events.find((event) => event.type === "error");
+      expect(error?.type === "error" && error.error.stopReason).toBe("aborted");
+      expect(error?.type === "error" && error.error.errorMessage).toContain("cancelled by caller");
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("exhausts the shared provider retry budget without starting a new Pi retry episode", async () => {
+    vi.useFakeTimers();
+    const mockFetch = vi.fn().mockResolvedValue(makeRequestRateResponse());
+    vi.stubGlobal("fetch", mockFetch);
+
+    try {
+      const eventsPromise = collect(streamKiro(makeModel(), makeContext(), { apiKey: "tok" }));
+      await vi.advanceTimersByTimeAsync(30_000);
+      const events = await eventsPromise;
+
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+      const error = events.find((event) => event.type === "error");
+      expect(error?.type === "error" && error.error.errorMessage).toBe(
+        "Kiro API error: request window retry budget exhausted (USER_REQUEST_RATE_EXCEEDED)",
+      );
+      expect(error?.type === "error" && isRetryableAssistantError(error.error)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("propagates an unknown 429 immediately so pi-coding-agent can own outer retries", async () => {
     const mockFetch = vi
       .fn()
       .mockResolvedValueOnce({
@@ -3218,6 +3500,9 @@ describe("Feature 9: Streaming Integration", () => {
   });
 
   it("does not retry repeated 429 responses inside the provider", async () => {
+    vi.useFakeTimers();
+    const originalTimeout = retryConfig.requestHeaderTimeoutMs;
+    retryConfig.requestHeaderTimeoutMs = 10;
     const mockFetch = vi.fn().mockResolvedValue({
       ok: false,
       status: 429,
@@ -3226,15 +3511,24 @@ describe("Feature 9: Streaming Integration", () => {
     });
     vi.stubGlobal("fetch", mockFetch);
 
-    const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
-    const events = await collect(stream);
+    try {
+      const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
+      const events = await collect(stream);
+      const requestInit = mockFetch.mock.calls[0]?.[1] as RequestInit;
+      const responseHeaderSignal = requestInit.signal as AbortSignal;
 
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-    const error = events.find((e) => e.type === "error");
-    expect(error).toBeDefined();
-    expect(error?.type === "error" && error.error.stopReason).toBe("error");
-
-    vi.unstubAllGlobals();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const error = events.find((e) => e.type === "error");
+      expect(error).toBeDefined();
+      expect(error?.type === "error" && error.error.stopReason).toBe("error");
+      await vi.advanceTimersByTimeAsync(11);
+      expect(responseHeaderSignal.aborted).toBe(false);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      retryConfig.requestHeaderTimeoutMs = originalTimeout;
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   }, 15000);
 
   it("aborts promptly during 403 retry backoff delay", async () => {
@@ -4032,6 +4326,35 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
+  it("normalizes cross-provider tool call IDs for Kiro requests", async () => {
+    const openAiToolCallId = "call_7co4xEgttSQcqULvGmpE7qVJ|fc_07f9a04520d21e6a016a912c2adb8487d0aa2368675a637b3b";
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: "Read the file", timestamp: ts },
+        makeToolCall(openAiToolCallId),
+        makeToolResult(openAiToolCallId),
+      ],
+      tools: [{ name: "read", description: "Read a file", parameters: { type: "object", properties: {} } }],
+    };
+    const mockFetch = mockFetchOk('{"content":"Done."}{"contextUsagePercentage":8}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel(), context, { apiKey: "tok" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const toolUseId = body.conversationState.history
+      .flatMap((entry: KiroHistoryEntry) => entry.assistantResponseMessage?.toolUses ?? [])
+      .at(-1).toolUseId;
+    const toolResultId =
+      body.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults[0].toolUseId;
+    expect(toolUseId).toBe(toolResultId);
+    expect(toolUseId).toMatch(/^[a-zA-Z0-9_.:-]{1,64}$/);
+    expect(toolUseId).not.toBe(openAiToolCallId);
+
+    vi.unstubAllGlobals();
+  });
+
   it("keeps ordinary whitespace-containing text intact", async () => {
     vi.stubGlobal("fetch", mockFetchOk('{"content":"line one\\n\\nline two\\n"}{"contextUsagePercentage":5}'));
 
@@ -4041,6 +4364,85 @@ describe("Feature 9: Streaming Integration", () => {
     expect(done).toBeDefined();
     const text = done?.type === "done" ? done.message.content.find((b) => b.type === "text") : undefined;
     expect(text?.type === "text" && text.text).toBe("line one\n\nline two\n");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("strips historical images when the active model is text-only", async () => {
+    const imageContent: ImageContent = { type: "image", data: "image-data", mimeType: "image/png" };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Look" }, imageContent], timestamp: ts },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "I saw it" }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "gpt-text-only",
+          usage: zeroUsage,
+          stopReason: "stop",
+          timestamp: ts,
+        } as AssistantMessage,
+        { role: "user", content: "Describe it again", timestamp: ts },
+      ],
+    };
+    const mockFetch = mockFetchOk('{"content":"No image available"}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    await collect(streamKiro(makeModel({ input: ["text"] }), context, { apiKey: "tok" }));
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(JSON.stringify(body.conversationState.history ?? [])).not.toContain("image-data");
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps only the newest bounded historical image", async () => {
+    const largeImage: ImageContent = { type: "image", data: "y".repeat(500000), mimeType: "image/jpeg" };
+    const context: Context = {
+      systemPrompt: "You are helpful",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "Image 1" }, largeImage], timestamp: ts },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Got it" }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "claude-sonnet-4-5",
+          usage: zeroUsage,
+          stopReason: "stop",
+          timestamp: ts,
+        } as AssistantMessage,
+        { role: "user", content: [{ type: "text", text: "Image 2" }, largeImage], timestamp: ts },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Got that too" }],
+          api: "kiro-api",
+          provider: "kiro",
+          model: "claude-sonnet-4-5",
+          usage: zeroUsage,
+          stopReason: "stop",
+          timestamp: ts,
+        } as AssistantMessage,
+        { role: "user", content: "Describe both images", timestamp: ts },
+      ],
+    };
+    const mockFetch = mockFetchOk('{"content":"Both were photos."}{"contextUsagePercentage":5}');
+    vi.stubGlobal("fetch", mockFetch);
+
+    const stream = streamKiro(makeModel(), context, { apiKey: "tok" });
+    const events = await collect(stream);
+
+    const done = events.find((e) => e.type === "done");
+    expect(done).toBeDefined();
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    const imageEntries = (body.conversationState.history ?? []).filter(
+      (entry: KiroHistoryEntry) => (entry.userInputMessage?.images?.length ?? 0) > 0,
+    );
+    expect(imageEntries).toHaveLength(1);
+    expect(imageEntries[0].userInputMessage.images[0].source.bytes).toHaveLength(500000);
+    expect(JSON.stringify(body).length).toBeLessThan(850000);
 
     vi.unstubAllGlobals();
   });

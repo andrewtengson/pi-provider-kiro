@@ -47,16 +47,22 @@ import {
   resolveKiroProfileArn,
 } from "./management.js";
 import { resolveKiroModel } from "./models.js";
+import { kiroAuthHeaders } from "./oauth.js";
 import {
   capacityRetryConfig,
   exponentialBackoff,
+  extractKiroReason,
   firstTokenTimeoutForModel,
   isCapacityError,
   isNonRetryableBodyError,
   isTooBigError,
+  KIRO_REASON_CODES,
   MAX_RETRY_DELAY,
+  resolveRequestRateRetryDelay,
+  retryConfig,
 } from "./retry.js";
 import { ThinkingTagParser } from "./thinking-parser.js";
+import { kiroTokenTypeHeaders } from "./token-type.js";
 import { countTokens } from "./tokenizer.js";
 import {
   buildHistory,
@@ -74,6 +80,7 @@ import {
   relocateDisplacedToolResults,
   sanitizeSurrogates,
   TOOL_RESULT_LIMIT,
+  toKiroToolUseId,
   truncate,
 } from "./transform.js";
 import { TRUNCATION_NOTICE, wasPreviousResponseTruncated } from "./truncation.js";
@@ -109,16 +116,55 @@ function logCapacityEvent(message: string): void {
 function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        reject(signal.reason);
-      },
-      { once: true },
-    );
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function createResponseHeaderDeadline(
+  callerSignal: AbortSignal | undefined,
+  timeoutMs: number,
+): {
+  signal: AbortSignal;
+  didTimeout: () => boolean;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout>;
+  const onCallerAbort = () => {
+    clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", onCallerAbort);
+    controller.abort(callerSignal?.reason);
+  };
+  timer = setTimeout(() => {
+    timedOut = true;
+    callerSignal?.removeEventListener("abort", onCallerAbort);
+    controller.abort(new DOMException("Kiro response headers timeout", "TimeoutError"));
+  }, timeoutMs);
+
+  if (callerSignal?.aborted) {
+    onCallerAbort();
+  } else {
+    callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    cleanup: () => {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    },
+  };
 }
 
 interface KiroRequest {
@@ -303,7 +349,7 @@ export function streamKiro(
       let retryCount = 0;
       const maxRetries = 3;
       const conversationId = options?.sessionId ?? crypto.randomUUID();
-      while (retryCount <= maxRetries) {
+      requestLoop: while (retryCount <= maxRetries) {
         if (options?.signal?.aborted) throw options.signal.reason;
         const effectiveSystemPrompt = systemPrompt;
         // Relocate a tool result that arrived behind a later assistant turn than
@@ -319,7 +365,7 @@ export function streamKiro(
           currentMsgStartIdx,
         } = buildHistory(normalized, kiroModelId, effectiveSystemPrompt);
         // Preserve semantic context locally; Pi owns lossy compaction.
-        const history = prepareHistory(rawHistory);
+        const history = prepareHistory(rawHistory, model.input.includes("image"));
         const dynamicHistoryLimit = Math.floor((model.contextWindow / HISTORY_LIMIT_CONTEXT_WINDOW) * HISTORY_LIMIT);
         const toolResultLimit = TOOL_RESULT_LIMIT;
         const currentMessages = normalized.slice(currentMsgStartIdx);
@@ -349,7 +395,7 @@ export function streamKiro(
                 const tc = b as ToolCall;
                 armToolUses.push({
                   name: tc.name,
-                  toolUseId: tc.id,
+                  toolUseId: toKiroToolUseId(tc.id),
                   input:
                     typeof tc.arguments === "string"
                       ? JSON.parse(tc.arguments)
@@ -386,7 +432,7 @@ export function streamKiro(
               currentToolResults.push({
                 content: [{ text: truncate(getContentText(m), toolResultLimit) }],
                 status: trm.isError ? "error" : "success",
-                toolUseId: trm.toolCallId,
+                toolUseId: toKiroToolUseId(trm.toolCallId),
               });
               if (Array.isArray(trm.content))
                 for (const c of trm.content) if (c.type === "image") toolResultImages.push(c as ImageContent);
@@ -408,7 +454,7 @@ export function streamKiro(
               currentToolResults.push({
                 content: [{ text: truncate(getContentText(m), toolResultLimit) }],
                 status: trm.isError ? "error" : "success",
-                toolUseId: trm.toolCallId,
+                toolUseId: toKiroToolUseId(trm.toolCallId),
               });
               if (Array.isArray(trm.content))
                 for (const c of trm.content) if (c.type === "image") toolResultImages2.push(c as ImageContent);
@@ -580,22 +626,44 @@ export function streamKiro(
             toolResultCount: wireUimc?.toolResults?.length ?? 0,
             request,
           });
-          response = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "application/vnd.amazon.eventstream",
-              Authorization: `Bearer ${accessToken}`,
-              "x-amzn-codewhisperer-optout": "true",
-              "amz-sdk-invocation-id": crypto.randomUUID(),
-              "amz-sdk-request": "attempt=1; max=1",
-              "x-amzn-kiro-agent-mode": "vibe",
-              "x-amz-user-agent": ua,
-              "user-agent": ua,
-            },
-            body: JSON.stringify(request),
-            signal: options?.signal,
-          });
+          const responseHeaderDeadline = createResponseHeaderDeadline(
+            options?.signal,
+            retryConfig.requestHeaderTimeoutMs,
+          );
+          let responseHeadersTimedOut = false;
+          try {
+            response = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "application/vnd.amazon.eventstream",
+                ...kiroAuthHeaders(accessToken),
+                ...kiroTokenTypeHeaders(accessToken),
+                "x-amzn-codewhisperer-optout": "true",
+                "amz-sdk-invocation-id": crypto.randomUUID(),
+                "amz-sdk-request": "attempt=1; max=1",
+                "x-amzn-kiro-agent-mode": "vibe",
+                "x-amz-user-agent": ua,
+                "user-agent": ua,
+              },
+              body: JSON.stringify(request),
+              signal: responseHeaderDeadline.signal,
+            });
+          } catch (error) {
+            if (!responseHeaderDeadline.didTimeout() || options?.signal?.aborted) throw error;
+            responseHeadersTimedOut = true;
+          } finally {
+            responseHeaderDeadline.cleanup();
+          }
+          if (responseHeadersTimedOut) {
+            if (retryCount >= maxRetries) {
+              throw new Error("Kiro API error: response headers timeout after max retries");
+            }
+            retryCount++;
+            const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY);
+            await abortableDelay(delayMs, options?.signal);
+            continue requestLoop;
+          }
           if (!response.ok) {
             let errText = "";
             try {
@@ -604,7 +672,17 @@ export function streamKiro(
               errText = "";
             }
             const safeStatusText = redactSensitiveText(response.statusText);
-            debugLog("response.error", { status: response.status, statusText: safeStatusText, body: errText });
+            const reasonCode = extractKiroReason(errText);
+            const isRequestRateExceeded =
+              response.status === 429 &&
+              reasonCode === KIRO_REASON_CODES.USER_REQUEST_RATE_EXCEEDED &&
+              !isNonRetryableBodyError(errText) &&
+              !isCapacityError(errText);
+            debugLog("response.error", {
+              status: response.status,
+              statusText: safeStatusText,
+              ...(isRequestRateExceeded ? { reasonCode } : { body: errText }),
+            });
             // Retry transient capacity errors with longer backoff
             if (isCapacityError(errText) && capacityRetryCount < capacityRetryConfig.maxRetries) {
               capacityRetryCount++;
@@ -618,6 +696,25 @@ export function streamKiro(
               logCapacityEvent(
                 `INSUFFICIENT_MODEL_CAPACITY — exhausted ${capacityRetryConfig.maxRetries} retries, giving up`,
               );
+            }
+            if (isRequestRateExceeded) {
+              if (retryCount >= maxRetries) {
+                throw new Error(
+                  `Kiro API error: request window retry budget exhausted (${KIRO_REASON_CODES.USER_REQUEST_RATE_EXCEEDED})`,
+                );
+              }
+              retryCount++;
+              const retryDelay = resolveRequestRateRetryDelay(response.headers);
+              debugLog("request.rateWindowRetry", {
+                attempt: retryCount,
+                maxRetries,
+                delayMs: retryDelay.delayMs,
+                advertisedDelayMs: retryDelay.advertisedDelayMs,
+                capped: retryDelay.capped,
+                reasonCode,
+              });
+              await abortableDelay(retryDelay.delayMs, options?.signal);
+              continue requestLoop;
             }
             if (response.status === 403 && !isCapacityError(errText) && retryCount < maxRetries) {
               retryCount++;

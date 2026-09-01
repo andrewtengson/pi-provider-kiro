@@ -55,13 +55,16 @@ Raw bytes → `parseKiroEvents()` → typed `KiroStreamEvent` → `ThinkingTagPa
 ### Retry with Reduction
 On 413/too-large: error propagated immediately to the caller (no retry). The caller is responsible for handling context overflow (e.g., compaction or history trimming), matching kiro-cli behavior.
 
+HTTP 429 is provider-retried only when its JSON `reason` is exactly `USER_REQUEST_RATE_EXCEEDED`; server wait hints and the 10-second fallback/cap are owned by `src/retry.ts`. Other generic 429/5xx responses remain owned by Pi's outer retry layer.
+
 ### Credential Cascade
-1. kiro-cli SQLite DB — checks social token first (`kirocli:social:token`), then IDC token
+1. kiro-cli SQLite DB — checks social token first (`kirocli:social:token`), then IDC token, then external IdP token (`kirocli:external-idp:token`)
 2. OAuth device code flow (interactive, opens browser)
 
 ### Auth Methods
 - `idc`: AWS Builder ID or IAM Identity Center (SSO). Refresh via SSO OIDC endpoint. Token format: `refreshToken|clientId|clientSecret|idc`. Preferred — has clientId/clientSecret for refresh.
 - `desktop`: Google/GitHub social login via Kiro auth service. Refresh via `prod.{region}.auth.desktop.kiro.dev`. Token format: `refreshToken|desktop`
+- `external-idp`: Enterprise OIDC IdP (e.g. Okta) configured by the org, established by `kiro-cli login`. Refresh is a public-client `refresh_token` grant against the tenant's own `token_endpoint` (form-encoded, snake_case response, no client secret). Token format: `refreshToken|clientId|tokenEndpoint|external-idp`. Requests **must** carry `tokentype: EXTERNAL_IDP` or Kiro answers 403 "Invalid token" — see `src/token-type.ts`.
 
 ### Login Methods
 Users can authenticate via:
@@ -101,3 +104,10 @@ npm run test:watch # vitest (watch mode)
 - Output token count is estimated (`content.length / 4`), not from the API
 - `contextUsagePercentage` is the only usage metric Kiro provides; input tokens are back-calculated
 - Social login (Google/GitHub) requires `kiro-cli` to be installed — pi delegates the auth flow to it
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.

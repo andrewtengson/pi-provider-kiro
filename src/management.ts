@@ -4,6 +4,8 @@
 import { createHash } from "node:crypto";
 import { debugLog, redactSensitiveText } from "./debug.js";
 import { getKiroEndpoints } from "./endpoints.js";
+import { kiroAuthHeaders } from "./oauth.js";
+import { kiroTokenTypeHeaders } from "./token-type.js";
 
 const LIST_PROFILES_PATH = "List-Available-Profiles";
 const LIST_MODELS_PATH = "List-Available-Models";
@@ -101,7 +103,8 @@ async function requestManagement<TResponse>(
     method,
     headers: {
       Accept: "application/json",
-      Authorization: `Bearer ${auth.accessToken}`,
+      ...kiroAuthHeaders(auth.accessToken),
+      ...kiroTokenTypeHeaders(auth.accessToken),
     },
   };
   if (method === "GET") {
@@ -185,16 +188,31 @@ export async function resolveKiroProfileArn(auth: KiroManagementAuth, providedAr
     // ListAvailableProfiles is regional to where the profile actually lives, not
     // to the SSO-derived API region. Probe the primary region first, then the
     // remaining canonical management regions, so a region-mismatched token still
-    // resolves a profile instead of failing hard (#104).
+    // resolves a profile instead of failing hard (#104, #131).
     let lastResponse: KiroListAvailableProfilesResponse | undefined;
+    let lastHttpError: KiroManagementHttpError | undefined;
     for (const region of candidateManagementRegions(auth.region)) {
-      const response = await requestManagement<KiroListAvailableProfilesResponse>(
-        { ...auth, region },
-        "ListAvailableProfiles",
-        LIST_PROFILES_PATH,
-        "POST",
-        {},
-      );
+      let response: KiroListAvailableProfilesResponse;
+      try {
+        response = await requestManagement<KiroListAvailableProfilesResponse>(
+          { ...auth, region },
+          "ListAvailableProfiles",
+          LIST_PROFILES_PATH,
+          "POST",
+          {},
+        );
+      } catch (error) {
+        // A regional 403 means the token has no profile *in this region*, not
+        // that it is globally rejected. The profile can live in another
+        // canonical region, so keep probing; only rethrow if no region yields
+        // a profile, so callers that treat a 403 as "refresh credentials and
+        // retry" (#107) still see the auth-plane signal when it is genuine.
+        if (error instanceof KiroManagementHttpError && error.status === 403) {
+          lastHttpError = error;
+          continue;
+        }
+        throw error;
+      }
       lastResponse = response;
       const arn = response.profiles?.find((profile) => profile.arn)?.arn;
       if (arn) {
@@ -204,6 +222,7 @@ export async function resolveKiroProfileArn(auth: KiroManagementAuth, providedAr
         return arn;
       }
     }
+    if (lastHttpError) throw lastHttpError;
     const attemptedRegions = candidateManagementRegions(auth.region).join(", ");
     throw new Error(
       `Kiro management ListAvailableProfiles returned no profile in ${attemptedRegions} ` +
@@ -277,7 +296,8 @@ export async function getUsageLimits<TResponse>(
       method: "GET",
       headers: {
         Accept: "application/json",
-        Authorization: `Bearer ${auth.accessToken}`,
+        ...kiroAuthHeaders(auth.accessToken),
+        ...kiroTokenTypeHeaders(auth.accessToken),
         "User-Agent": "pi-provider-kiro",
       },
     });
